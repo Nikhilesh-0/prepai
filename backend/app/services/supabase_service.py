@@ -15,85 +15,72 @@ def get_client() -> Client:
 
 
 async def save_session(session_data: dict) -> dict:
-    """Insert a new session into the sessions table."""
+    """Insert a new session into the sessions table, return the created row."""
+    import uuid as _uuid
     client = get_client()
-    # Do NOT pass 'id' — let Supabase generate it via uuid_generate_v4()
-    # Use .select() to ensure the inserted row (including generated id) is returned
-    response = (
-        client.table("sessions")
-        .insert({
-            "user_id": session_data["user_id"],
-            "jd_text": session_data["jd_text"],
-            "role_title": session_data.get("role_title"),
-            "level": session_data.get("level"),
-            "domain": session_data.get("domain"),
-            "tech_stack": session_data.get("tech_stack", []),
-            "status": "in_progress",
-        })
-        .select()
-        .execute()
-    )
-    if not response.data:
-        raise RuntimeError("Supabase insert returned no data for sessions table")
-    return response.data[0]
+
+    # Generate the UUID ourselves so we can fetch it back reliably
+    session_id = str(_uuid.uuid4())
+
+    client.table("sessions").insert({
+        "id": session_id,
+        "user_id": session_data["user_id"],
+        "jd_text": session_data["jd_text"],
+        "role_title": session_data.get("role_title"),
+        "level": session_data.get("level"),
+        "domain": session_data.get("domain"),
+        "tech_stack": session_data.get("tech_stack", []),
+        "status": "in_progress",
+    }).execute()
+
+    # Fetch the row back using the known id
+    fetch = client.table("sessions").select("*").eq("id", session_id).execute()
+    if not fetch.data:
+        raise RuntimeError(f"Session insert succeeded but fetch returned nothing (id={session_id})")
+    return fetch.data[0]
 
 
 async def save_question(question_data: dict) -> dict:
     """Insert a question record."""
     client = get_client()
-    response = (
-        client.table("questions")
-        .insert({
-            "session_id": question_data["session_id"],
-            "question_text": question_data["question_text"],
-            "question_type": question_data["question_type"],
-            "order_index": question_data["order_index"],
-            "follow_up_hint": question_data.get("follow_up_hint"),
-        })
-        .select()
-        .execute()
-    )
-    return response.data[0] if response.data else {}
+    client.table("questions").insert({
+        "session_id": question_data["session_id"],
+        "question_text": question_data["question_text"],
+        "question_type": question_data["question_type"],
+        "order_index": question_data["order_index"],
+        "follow_up_hint": question_data.get("follow_up_hint"),
+    }).execute()
+    return {}
 
 
 async def save_response(response_data: dict) -> dict:
     """Insert a user response record."""
     client = get_client()
-    response = (
-        client.table("responses")
-        .insert({
-            "session_id": response_data["session_id"],
-            "question_id": response_data["question_id"],
-            "transcript": response_data["transcript"],
-            "duration_seconds": response_data.get("duration_seconds"),
-        })
-        .select()
-        .execute()
-    )
-    return response.data[0] if response.data else {}
+    client.table("responses").insert({
+        "session_id": response_data["session_id"],
+        "question_id": response_data["question_id"],
+        "transcript": response_data["transcript"],
+        "duration_seconds": response_data.get("duration_seconds"),
+    }).execute()
+    return {}
 
 
 async def save_scorecard(scorecard_data: dict) -> dict:
     """Insert a scorecard record."""
     client = get_client()
-    response = (
-        client.table("scorecards")
-        .insert({
-            "session_id": scorecard_data["session_id"],
-            "overall_score": scorecard_data.get("overall_score", 0),
-            "communication_score": scorecard_data.get("communication_score", 0),
-            "technical_score": scorecard_data.get("technical_score", 0),
-            "confidence_score": scorecard_data.get("confidence_score", 0),
-            "filler_word_count": scorecard_data.get("filler_word_count", 0),
-            "strengths": scorecard_data.get("strengths", []),
-            "improvements": scorecard_data.get("improvements", []),
-            "summary": scorecard_data.get("summary", ""),
-            "detailed_feedback": scorecard_data.get("detailed_feedback", {}),
-        })
-        .select()
-        .execute()
-    )
-    return response.data[0] if response.data else {}
+    client.table("scorecards").insert({
+        "session_id": scorecard_data["session_id"],
+        "overall_score": scorecard_data.get("overall_score", 0),
+        "communication_score": scorecard_data.get("communication_score", 0),
+        "technical_score": scorecard_data.get("technical_score", 0),
+        "confidence_score": scorecard_data.get("confidence_score", 0),
+        "filler_word_count": scorecard_data.get("filler_word_count", 0),
+        "strengths": scorecard_data.get("strengths", []),
+        "improvements": scorecard_data.get("improvements", []),
+        "summary": scorecard_data.get("summary", ""),
+        "detailed_feedback": scorecard_data.get("detailed_feedback", {}),
+    }).execute()
+    return {}
 
 
 async def update_session_status(
