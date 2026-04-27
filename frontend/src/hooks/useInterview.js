@@ -22,10 +22,15 @@ export default function useInterview(sessionId) {
   const [errorMessage, setErrorMessage] = useState('')
 
   const aiTextBufferRef = useRef('')
-  const startedRef = useRef(false)    // user clicked Begin
-  const listeningRef = useRef(false)  // currently recording
+  const startedRef = useRef(false)
+  const listeningRef = useRef(false)
 
+  // ── Stable refs for WS functions (avoids stale closures in useAudio) ──────
   const { connectionState, sendMessage, sendBinary, onBinary, lastMessage } = useWebSocket(sessionId)
+  const sendMessageRef = useRef(sendMessage)
+  const sendBinaryRef = useRef(sendBinary)
+  useEffect(() => { sendMessageRef.current = sendMessage }, [sendMessage])
+  useEffect(() => { sendBinaryRef.current = sendBinary }, [sendBinary])
 
   const {
     initAudioContext,
@@ -33,19 +38,22 @@ export default function useInterview(sessionId) {
     startRecording,
     stopRecording,
     playAudioChunk,
+    resetPlaybackCursor,
     isMuted,
     toggleMute,
     isRecording,
     audioLevel,
-  } = useAudio(sendBinary, sendMessage)
+  } = useAudio(sendBinaryRef, sendMessageRef)
 
   useEffect(() => { onBinary(() => { }) }, [onBinary])
 
-  // ── Start recording (auto-called after AI speaks) ──────────────────────────
+  // ── Auto-start listening after AI finishes speaking ────────────────────────
   const doStartListening = useCallback(async () => {
     if (listeningRef.current) return
-    if (!startedRef.current) return  // don't auto-listen before user clicks Begin
+    if (!startedRef.current) return
     listeningRef.current = true
+    // Reset playback cursor so next AI audio plays immediately (not at old offset)
+    resetPlaybackCursor()
     try {
       await startRecording()
       setInterviewState(STATES.LISTENING)
@@ -55,7 +63,7 @@ export default function useInterview(sessionId) {
       setErrorMessage('Microphone error: ' + (err.message || 'unknown'))
       setInterviewState(STATES.ERROR)
     }
-  }, [startRecording])
+  }, [startRecording, resetPlaybackCursor])
 
   // ── WebSocket message handler ──────────────────────────────────────────────
   useEffect(() => {
@@ -68,7 +76,6 @@ export default function useInterview(sessionId) {
         setTotalQuestions(msg.total_questions)
         if (startedRef.current) {
           if (msg.is_ai_speaking) setInterviewState(STATES.AI_SPEAKING)
-          else if (msg.is_listening && !listeningRef.current) doStartListening()
         }
         break
       }
@@ -86,12 +93,13 @@ export default function useInterview(sessionId) {
       }
 
       case 'speaking_done': {
-        // Wait a beat for last audio chunk to finish playing, then auto-listen
+        // Backend has sent all audio chunks — give them ~1s to finish playing,
+        // then auto-start listening
         setTimeout(() => {
           aiTextBufferRef.current = ''
           listeningRef.current = false
           doStartListening()
-        }, 800)
+        }, 1000)
         break
       }
 
@@ -116,15 +124,16 @@ export default function useInterview(sessionId) {
       }
 
       case 'error': {
-        // Non-fatal errors: keep going (empty audio, transcription failed)
-        const fatal = false
+        // Show error message but DON'T crash to error state for recoverable errors
+        // (empty audio, transcription hiccup). Just log it.
+        console.warn('WS error:', msg.message)
         setErrorMessage(msg.message)
-        if (fatal) {
-          setInterviewState(STATES.ERROR)
-        }
-        // Re-enable listening after recoverable errors
+        // If we were processing, go back to listening
         if (startedRef.current && !listeningRef.current) {
-          setTimeout(() => doStartListening(), 1000)
+          setTimeout(() => {
+            listeningRef.current = false
+            doStartListening()
+          }, 1200)
         }
         break
       }
@@ -133,20 +142,19 @@ export default function useInterview(sessionId) {
     }
   }, [lastMessage, playAudioChunk, doStartListening])
 
-  // ── beginInterview: the user-gesture gate ─────────────────────────────────
+  // ── beginInterview ─────────────────────────────────────────────────────────
   const beginInterview = useCallback(async () => {
     try {
       initAudioContext()
       await requestMicPermission()
       startedRef.current = true
       setInterviewState(STATES.READY)
-      // Tell backend we're ready — it fires the first AI turn
       sendMessage({ type: 'client_ready' })
     } catch (err) {
       const denied = err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError'
       setErrorMessage(
         denied
-          ? 'Microphone access denied. Allow microphone in your browser settings, then reload the page.'
+          ? 'Microphone access denied. Allow microphone in your browser settings, then reload.'
           : 'Could not start: ' + err.message
       )
       setInterviewState(STATES.ERROR)
@@ -154,13 +162,14 @@ export default function useInterview(sessionId) {
   }, [initAudioContext, requestMicPermission, sendMessage])
 
   // ── stopListening: user clicks "done speaking" ────────────────────────────
-  const stopListening = useCallback(() => {
+  const stopListening = useCallback(async () => {
     listeningRef.current = false
-    stopRecording()           // sends audio_end to backend
     setInterviewState(STATES.PROCESSING)
+    // stopRecording is now async — it waits for the final chunk before sending audio_end
+    await stopRecording()
   }, [stopRecording])
 
-  // ── endInterview: user force-ends ─────────────────────────────────────────
+  // ── endInterview ──────────────────────────────────────────────────────────
   const endInterview = useCallback(() => {
     sendMessage({ type: 'end_interview' })
     setSessionComplete(true)
