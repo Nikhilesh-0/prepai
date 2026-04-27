@@ -26,7 +26,7 @@ export default function useInterview(sessionId) {
   const listeningRef = useRef(false)
   const speakingDoneTimerRef = useRef(null)
 
-  const { connectionState, sendMessage, sendBinary, onBinary, lastMessage } = useWebSocket(sessionId)
+  const { connectionState, sendMessage, sendBinary, onBinary, onMessage } = useWebSocket(sessionId)
   const sendMessageRef = useRef(sendMessage)
   const sendBinaryRef = useRef(sendBinary)
   useEffect(() => { sendMessageRef.current = sendMessage }, [sendMessage])
@@ -45,11 +45,13 @@ export default function useInterview(sessionId) {
     audioLevel,
   } = useAudio(sendBinaryRef, sendMessageRef)
 
-  // Keep a ref to startRecording so setTimeout never closes over stale version
+  // Keep refs so callbacks inside the message handler never close over stale values
   const startRecordingRef = useRef(startRecording)
   const resetPlaybackCursorRef = useRef(resetPlaybackCursor)
+  const playAudioChunkRef = useRef(playAudioChunk)
   useEffect(() => { startRecordingRef.current = startRecording }, [startRecording])
   useEffect(() => { resetPlaybackCursorRef.current = resetPlaybackCursor }, [resetPlaybackCursor])
+  useEffect(() => { playAudioChunkRef.current = playAudioChunk }, [playAudioChunk])
 
   useEffect(() => { onBinary(() => { }) }, [onBinary])
 
@@ -71,71 +73,70 @@ export default function useInterview(sessionId) {
       })
   }, []) // no dependencies — reads everything via refs
 
-  // ── WebSocket message handler ──────────────────────────────────────────────
+  // ── WebSocket message handler (direct callback — no React batching) ────────
   useEffect(() => {
-    if (!lastMessage) return
-    const msg = lastMessage
+    onMessage((msg) => {
+      switch (msg.type) {
+        case 'state_update': {
+          setQuestionIndex(msg.current_question_index)
+          setTotalQuestions(msg.total_questions)
+          break
+        }
 
-    switch (msg.type) {
-      case 'state_update': {
-        setQuestionIndex(msg.current_question_index)
-        setTotalQuestions(msg.total_questions)
-        break
-      }
+        case 'ai_text_chunk': {
+          aiTextBufferRef.current += msg.text
+          setAiTextStream(aiTextBufferRef.current)
+          if (startedRef.current) setInterviewState(STATES.AI_SPEAKING)
+          break
+        }
 
-      case 'ai_text_chunk': {
-        aiTextBufferRef.current += msg.text
-        setAiTextStream(aiTextBufferRef.current)
-        if (startedRef.current) setInterviewState(STATES.AI_SPEAKING)
-        break
-      }
+        case 'audio_response_chunk': {
+          if (msg.audio) playAudioChunkRef.current(msg.audio)
+          break
+        }
 
-      case 'audio_response_chunk': {
-        if (msg.audio) playAudioChunk(msg.audio)
-        break
-      }
+        case 'speaking_done': {
+          // Clear any pending timer
+          if (speakingDoneTimerRef.current) clearTimeout(speakingDoneTimerRef.current)
+          // Wait for audio to finish playing (~1.2s), then start listening
+          speakingDoneTimerRef.current = setTimeout(() => {
+            listeningRef.current = false
+            triggerListening()
+          }, 1200)
+          break
+        }
 
-      case 'speaking_done': {
-        // Clear any pending timer
-        if (speakingDoneTimerRef.current) clearTimeout(speakingDoneTimerRef.current)
-        // Wait for audio to finish playing (~1.2s), then start listening
-        speakingDoneTimerRef.current = setTimeout(() => {
+        case 'transcript': {
           listeningRef.current = false
-          triggerListening()
-        }, 1200)
-        break
-      }
+          setTranscript(msg.text)
+          setInterviewState(STATES.PROCESSING)
+          setAiTextStream('')
+          aiTextBufferRef.current = ''
+          break
+        }
 
-      case 'transcript': {
-        listeningRef.current = false
-        setTranscript(msg.text)
-        setInterviewState(STATES.PROCESSING)
-        setAiTextStream('')
-        aiTextBufferRef.current = ''
-        break
-      }
+        case 'processing_start': {
+          setInterviewState(STATES.PROCESSING)
+          break
+        }
 
-      case 'processing_start': {
-        setInterviewState(STATES.PROCESSING)
-        break
-      }
+        case 'interview_complete': {
+          setSessionComplete(true)
+          setInterviewState(STATES.COMPLETE)
+          break
+        }
 
-      case 'interview_complete': {
-        setSessionComplete(true)
-        setInterviewState(STATES.COMPLETE)
-        break
-      }
+        case 'error': {
+          console.warn('WS error:', msg.message)
+          setErrorMessage(msg.message)
+          setTimeout(() => setErrorMessage(''), 4000)
+          break
+        }
 
-      case 'error': {
-        console.warn('WS error:', msg.message)
-        setErrorMessage(msg.message)
-        setTimeout(() => setErrorMessage(''), 4000)
-        break
+        default: break
       }
-
-      default: break
-    }
-  }, [lastMessage, playAudioChunk, triggerListening])
+    })
+  }, [onMessage, triggerListening])
 
   // Cleanup timer on unmount
   useEffect(() => {

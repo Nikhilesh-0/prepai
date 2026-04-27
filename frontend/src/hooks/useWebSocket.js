@@ -7,11 +7,11 @@ const BASE_DELAY = 1000
 export default function useWebSocket(sessionId) {
   const wsRef = useRef(null)
   const [connectionState, setConnectionState] = useState('disconnected')
-  const [lastMessage, setLastMessage] = useState(null)
   const retryCountRef = useRef(0)
   const retryTimerRef = useRef(null)
   const shouldReconnectRef = useRef(true)
   const onBinaryRef = useRef(null) // callback for binary frames
+  const onMessageRef = useRef(null) // callback for JSON messages — bypasses React batching
 
   const connect = useCallback(() => {
     if (!sessionId) return
@@ -42,7 +42,11 @@ export default function useWebSocket(sessionId) {
       if (typeof event.data === 'string') {
         try {
           const parsed = JSON.parse(event.data)
-          setLastMessage(parsed)
+          // Direct synchronous callback — bypasses React setState batching
+          // so every single message is guaranteed to be processed
+          if (onMessageRef.current) {
+            onMessageRef.current(parsed)
+          }
         } catch (e) {
           console.error('Failed to parse WS message:', e)
         }
@@ -101,12 +105,16 @@ export default function useWebSocket(sessionId) {
     onBinaryRef.current = handler
   }, [])
 
+  const onMessage = useCallback((handler) => {
+    onMessageRef.current = handler
+  }, [])
+
   return {
     wsRef,
     connectionState,
     sendMessage,
     sendBinary,
     onBinary,
-    lastMessage,
+    onMessage,
   }
 }
