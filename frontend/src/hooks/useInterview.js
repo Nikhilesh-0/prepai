@@ -136,8 +136,15 @@ export default function useInterview(sessionId) {
 
         case 'error': {
           console.warn('WS error:', msg.message)
-          setErrorMessage(msg.message)
-          setTimeout(() => setErrorMessage(''), 4000)
+          // If the session was lost (server restart), mark it so the UI can redirect
+          if (msg.message && msg.message.toLowerCase().includes('session not found')) {
+            setErrorMessage('Session expired. Redirecting to dashboard...')
+            setInterviewState(STATES.ERROR)
+            setSessionComplete(true)  // triggers redirect
+          } else {
+            setErrorMessage(msg.message)
+            setTimeout(() => setErrorMessage(''), 4000)
+          }
           break
         }
 

@@ -51,9 +51,8 @@ async def tts_for_sentence(sentence: str) -> bytes:
 
 async def handle_ai_turn(ws: WebSocket, session_id: str):
     """
-    Run one full AI turn. LLM text streams to the frontend immediately.
-    TTS runs in a background task so the LLM stream is never blocked.
-    Always sends speaking_done at the end.
+    Run one full AI turn. Always sends speaking_done at the end,
+    even if TTS fails — that way the frontend never gets stuck.
     """
     session = await session_manager.get_session(session_id)
     if not session:
@@ -66,32 +65,6 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
     full_response = ""
     sentence_buffer = ""
     tts_failed = False
-
-    # Queue for TTS: LLM producer puts sentences in, background worker consumes them
-    tts_queue = asyncio.Queue()
-
-    async def tts_worker():
-        """Background task: pulls sentences from the queue and sends audio to the client."""
-        nonlocal tts_failed
-        while True:
-            sentence = await tts_queue.get()
-            if sentence is None:  # poison pill — LLM is done
-                break
-            try:
-                audio = await tts_for_sentence(sentence)
-                if audio:
-                    await send_json(ws, {
-                        "type": "audio_response_chunk",
-                        "audio": base64.b64encode(audio).decode("utf-8"),
-                    })
-                else:
-                    tts_failed = True
-            except Exception as e:
-                print(f"[TTS WORKER] Error: {e}")
-                tts_failed = True
-
-    # Start TTS worker in background
-    worker_task = asyncio.create_task(tts_worker())
 
     try:
         async for text_chunk in stream_interviewer_response(
@@ -106,18 +79,32 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
             # Stream text to frontend immediately for typewriter display
             await send_json(ws, {"type": "ai_text_chunk", "text": text_chunk})
 
-            # Queue complete sentences for TTS (non-blocking)
+            # Send complete sentences to TTS as they form
             sentences = split_into_tts_chunks(sentence_buffer)
             if len(sentences) > 1:
                 for sentence in sentences[:-1]:
                     s = sentence.strip()
                     if s:
-                        await tts_queue.put(s)
+                        audio = await tts_for_sentence(s)
+                        if audio:
+                            await send_json(ws, {
+                                "type": "audio_response_chunk",
+                                "audio": base64.b64encode(audio).decode("utf-8"),
+                            })
+                        else:
+                            tts_failed = True
                 sentence_buffer = sentences[-1]
 
         # Flush last sentence
         if sentence_buffer.strip():
-            await tts_queue.put(sentence_buffer.strip())
+            audio = await tts_for_sentence(sentence_buffer.strip())
+            if audio:
+                await send_json(ws, {
+                    "type": "audio_response_chunk",
+                    "audio": base64.b64encode(audio).decode("utf-8"),
+                })
+            else:
+                tts_failed = True
 
     except Exception as e:
         # LLM streaming failed — still need to unblock the frontend
@@ -125,10 +112,6 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
         traceback.print_exc()
         full_response = full_response or "I encountered an issue. Let's continue — please go ahead."
         await send_json(ws, {"type": "error", "message": f"LLM error: {str(e)}"})
-
-    # Signal TTS worker to stop, then wait for it to finish all queued sentences
-    await tts_queue.put(None)
-    await worker_task
 
     # Save whatever response we got
     if full_response:
@@ -145,6 +128,7 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
         "is_listening": True,
     })
     await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
+
 
 
 

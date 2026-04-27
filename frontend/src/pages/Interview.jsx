@@ -53,11 +53,19 @@ export default function Interview() {
     audioLevel,
   } = useInterview(sessionId)
 
-  // Navigate to scorecard after completion
+  // Navigate after completion
   useEffect(() => {
-    if (sessionComplete && interviewState === STATES.COMPLETE) {
-      const t = setTimeout(() => navigate(`/scorecard/${sessionId}`), 2500)
-      return () => clearTimeout(t)
+    if (sessionComplete) {
+      if (interviewState === STATES.ERROR) {
+        // Session expired — go back to dashboard
+        const t = setTimeout(() => navigate('/dashboard'), 2000)
+        return () => clearTimeout(t)
+      }
+      if (interviewState === STATES.COMPLETE) {
+        // Normal completion — show scorecard
+        const t = setTimeout(() => navigate(`/scorecard/${sessionId}`), 2500)
+        return () => clearTimeout(t)
+      }
     }
   }, [sessionComplete, interviewState, sessionId, navigate])
 

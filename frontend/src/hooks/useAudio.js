@@ -10,6 +10,7 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
   const playbackCursorRef = useRef(0)
   const animFrameRef = useRef(null)
   const isRecordingRef = useRef(false)  // ref version to avoid stale closures
+  const pendingSendsRef = useRef([])    // tracks in-flight arrayBuffer→sendBinary promises
 
   const [isRecording, setIsRecording] = useState(false)
   const [isMuted, setIsMuted] = useState(false)
@@ -121,10 +122,11 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
 
     recorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0 && !isMutedRef.current) {
-        event.data.arrayBuffer().then((buffer) => {
-          // Use the ref to always get the current sendBinary function
+        // Track each async send so we can await them all before sending audio_end
+        const sendPromise = event.data.arrayBuffer().then((buffer) => {
           sendBinaryRef.current?.(buffer)
         })
+        pendingSendsRef.current.push(sendPromise)
       }
     }
 
@@ -144,12 +146,18 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
       micStreamRef.current = null
     }
 
-    // Stop recorder and wait for final chunk to flush
+    // Stop recorder and wait for onstop to fire
     await stopCurrentRecorder()
+
+    // Wait for ALL pending arrayBuffer→sendBinary promises to complete.
+    // This is critical: onstop fires BEFORE the last ondataavailable's .then()
+    // resolves, so without this, audio_end would be sent before the last chunk.
+    await Promise.all(pendingSendsRef.current)
+    pendingSendsRef.current = []
 
     setIsRecording(false)
 
-    // Now it's safe to signal end-of-audio — all binary chunks have been sent
+    // NOW it's truly safe — every binary chunk has been sent
     sendMessageRef.current?.({ type: 'audio_end' })
   }, [stopCurrentRecorder, stopLevelMeter, sendMessageRef])
 
