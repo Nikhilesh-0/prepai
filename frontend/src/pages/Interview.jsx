@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react'
+import React, { useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import useInterview, { STATES } from '../hooks/useInterview'
 import AIIndicator from '../components/interview/AIIndicator'
@@ -8,50 +8,35 @@ import ProgressBar from '../components/interview/ProgressBar'
 import Controls from '../components/interview/Controls'
 import Button from '../components/ui/Button'
 
-function orbState(interviewState) {
-  switch (interviewState) {
-    case STATES.AI_SPEAKING: return 'speaking'
-    case STATES.LISTENING: return 'listening'
-    case STATES.PROCESSING: return 'processing'
-    default: return 'idle'
-  }
+function orbState(s) {
+  if (s === STATES.AI_SPEAKING) return 'speaking'
+  if (s === STATES.LISTENING) return 'listening'
+  if (s === STATES.PROCESSING || s === STATES.READY) return 'processing'
+  return 'idle'
 }
 
-function StatusLabel({ interviewState, connectionState }) {
-  if (connectionState === 'connecting') {
-    return (
-      <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>
-        connecting<span style={{ animation: 'blink 1s step-end infinite' }}>_</span>
-      </span>
-    )
+function StatusLabel({ state, connectionState }) {
+  if (connectionState === 'connecting' || connectionState === 'disconnected') {
+    return <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>connecting<span style={{ animation: 'blink 1s step-end infinite' }}>_</span></span>
   }
-  if (connectionState === 'error') {
-    return <span style={{ color: 'var(--danger)', fontSize: '12px' }}>[!] connection error</span>
-  }
-  switch (interviewState) {
-    case STATES.AI_SPEAKING:
-      return <span style={{ color: 'var(--accent)', fontSize: '12px' }}>● speaking</span>
-    case STATES.LISTENING:
-      return <span style={{ color: 'var(--accent)', fontSize: '12px' }}>● listening</span>
-    case STATES.PROCESSING:
-      return <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>processing<span style={{ animation: 'blink 1s step-end infinite' }}>_</span></span>
-    case STATES.COMPLETE:
-      return <span style={{ color: 'var(--accent)', fontSize: '12px' }}>interview complete</span>
-    case STATES.ERROR:
-      return <span style={{ color: 'var(--danger)', fontSize: '12px' }}>[!] error</span>
-    default:
-      return <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>initializing<span style={{ animation: 'blink 1s step-end infinite' }}>_</span></span>
+  switch (state) {
+    case STATES.IDLE: return <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>ready to begin</span>
+    case STATES.READY: return <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>waiting for interviewer<span style={{ animation: 'blink 1s step-end infinite' }}>_</span></span>
+    case STATES.AI_SPEAKING: return <span style={{ color: 'var(--accent)', fontSize: '12px' }}>● alex is speaking</span>
+    case STATES.LISTENING: return <span style={{ color: 'var(--accent)', fontSize: '12px' }}>● listening — speak now</span>
+    case STATES.PROCESSING: return <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>processing<span style={{ animation: 'blink 1s step-end infinite' }}>_</span></span>
+    case STATES.COMPLETE: return <span style={{ color: 'var(--accent)', fontSize: '12px' }}>interview complete</span>
+    case STATES.ERROR: return <span style={{ color: 'var(--danger)', fontSize: '12px' }}>[!] error</span>
+    default: return null
   }
 }
 
 export default function Interview() {
   const { sessionId } = useParams()
   const navigate = useNavigate()
-  const audioInitRef = useRef(false)
 
   const {
     interviewState,
-    currentQuestion,
     questionIndex,
     totalQuestions,
     transcript,
@@ -59,240 +44,162 @@ export default function Interview() {
     sessionComplete,
     errorMessage,
     connectionState,
-    startListening,
+    beginInterview,
     stopListening,
     endInterview,
-    initAudioContext,
     isMuted,
     toggleMute,
     isRecording,
     audioLevel,
   } = useInterview(sessionId)
 
-  // Initialize AudioContext on first render (needs prior user gesture from JDInput page)
-  useEffect(() => {
-    if (!audioInitRef.current) {
-      audioInitRef.current = true
-      try {
-        initAudioContext()
-      } catch (e) {
-        // Will be initialized on first interaction if needed
-      }
-    }
-  }, [initAudioContext])
-
-  // Navigate to scorecard when complete
+  // Navigate to scorecard after completion
   useEffect(() => {
     if (sessionComplete && interviewState === STATES.COMPLETE) {
-      const timer = setTimeout(() => {
-        navigate(`/scorecard/${sessionId}`)
-      }, 2000)
-      return () => clearTimeout(timer)
+      const t = setTimeout(() => navigate(`/scorecard/${sessionId}`), 2500)
+      return () => clearTimeout(t)
     }
   }, [sessionComplete, interviewState, sessionId, navigate])
 
   const isListening = interviewState === STATES.LISTENING
   const isAiSpeaking = interviewState === STATES.AI_SPEAKING
-  const isProcessing = interviewState === STATES.PROCESSING
+  const isIdle = interviewState === STATES.IDLE
+  const isError = interviewState === STATES.ERROR
+  const isComplete = interviewState === STATES.COMPLETE
 
   return (
     <div style={{
-      minHeight: '100vh',
-      background: 'var(--bg)',
-      display: 'flex',
-      flexDirection: 'column',
-      position: 'relative',
-      overflow: 'hidden',
+      minHeight: '100vh', background: 'var(--bg)',
+      display: 'flex', flexDirection: 'column',
+      position: 'relative', overflow: 'hidden',
     }}>
-      {/* Scanlines */}
       <div className="scanlines" />
 
       {/* Top bar */}
       <header style={{
         borderBottom: '1px solid var(--border)',
         padding: '12px 24px',
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        position: 'relative',
-        zIndex: 1,
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        position: 'relative', zIndex: 1,
       }}>
-        <span style={{
-          fontFamily: 'var(--font)',
-          fontWeight: '700',
-          fontSize: '13px',
-          color: 'var(--text-primary)',
-        }}>
+        <span style={{ fontFamily: 'var(--font)', fontWeight: '700', fontSize: '13px' }}>
           <span style={{ color: 'var(--accent)' }}>prep</span>ai
         </span>
-
-        <ProgressBar
-          current={questionIndex}
-          total={totalQuestions || 8}
-        />
+        <ProgressBar current={questionIndex} total={totalQuestions || 8} />
       </header>
 
-      {/* Main interview area */}
+      {/* Main */}
       <main style={{
-        flex: 1,
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        justifyContent: 'center',
-        padding: '40px 24px',
-        gap: '40px',
-        position: 'relative',
-        zIndex: 1,
+        flex: 1, display: 'flex', flexDirection: 'column',
+        alignItems: 'center', justifyContent: 'center',
+        padding: '40px 24px', gap: '36px',
+        position: 'relative', zIndex: 1,
       }}>
-        {/* Status label */}
-        <StatusLabel interviewState={interviewState} connectionState={connectionState} />
+        <StatusLabel state={interviewState} connectionState={connectionState} />
 
-        {/* AI Orb — the centerpiece */}
+        {/* Orb */}
         <AIIndicator state={orbState(interviewState)} />
 
-        {/* AI transcript — streams in character by character */}
-        <div style={{ maxWidth: '600px', width: '100%', textAlign: 'center' }}>
-          <LiveTranscript
-            text={aiTextStream}
-            isStreaming={isAiSpeaking}
-          />
+        {/* AI text stream */}
+        <div style={{ maxWidth: '600px', width: '100%', textAlign: 'center', minHeight: '80px' }}>
+          <LiveTranscript text={aiTextStream} isStreaming={isAiSpeaking} />
         </div>
 
-        {/* Waveform — visible when user is recording */}
+        {/* ── IDLE: Begin gate ── */}
+        {isIdle && connectionState === 'connected' && (
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px', animation: 'slide-up 0.3s ease' }}>
+            <Button
+              variant="primary"
+              onClick={beginInterview}
+              style={{ fontSize: '14px', padding: '14px 32px', fontWeight: '700' }}
+            >
+              Begin Interview
+            </Button>
+            <span style={{ color: 'var(--text-muted)', fontSize: '11px' }}>
+              Microphone access will be requested
+            </span>
+          </div>
+        )}
+
+        {/* ── IDLE: waiting for WS ── */}
+        {isIdle && connectionState !== 'connected' && (
+          <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>
+            connecting to session<span style={{ animation: 'blink 1s step-end infinite' }}>_</span>
+          </span>
+        )}
+
+        {/* ── LISTENING: waveform + done button ── */}
         {isListening && (
           <div style={{
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            gap: '16px',
+            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '20px',
             animation: 'slide-up 0.2s ease',
           }}>
             <WaveformBar audioLevel={audioLevel} active={isRecording} />
 
-            {/* User transcript preview */}
             {transcript && (
-              <div style={{
-                maxWidth: '500px',
-                color: 'var(--text-muted)',
-                fontSize: '13px',
-                lineHeight: '1.6',
-                textAlign: 'center',
-              }}>
-                <span style={{ color: 'var(--border-active)' }}>{'>'} </span>
-                {transcript}
+              <div style={{ maxWidth: '500px', color: 'var(--text-muted)', fontSize: '13px', lineHeight: '1.6', textAlign: 'center' }}>
+                <span style={{ color: 'var(--border-active)' }}>{'> '}</span>{transcript}
               </div>
             )}
 
-            {/* Done speaking button */}
             <Button
               variant="ghost"
               onClick={stopListening}
-              style={{
-                fontSize: '13px',
-                letterSpacing: '0.05em',
-                border: '1px solid var(--accent)',
-                color: 'var(--accent)',
-                padding: '10px 24px',
-              }}
+              style={{ fontSize: '13px', border: '1px solid var(--accent)', color: 'var(--accent)', padding: '10px 28px' }}
             >
-              [ done ]
+              [ done speaking ]
             </Button>
           </div>
         )}
 
-        {/* Processing state */}
-        {isProcessing && (
+        {/* ── After AI speaks, show last transcript if not currently listening ── */}
+        {!isListening && !isAiSpeaking && transcript && interviewState !== STATES.IDLE && interviewState !== STATES.READY && (
           <div style={{
-            color: 'var(--text-muted)',
-            fontSize: '12px',
-            letterSpacing: '0.08em',
-            animation: 'slide-up 0.2s ease',
+            maxWidth: '500px', color: 'var(--text-muted)', fontSize: '13px',
+            lineHeight: '1.6', textAlign: 'center',
+            borderTop: '1px solid var(--border)', paddingTop: '12px',
           }}>
-            Processing
-            <span style={{ animation: 'blink 1s step-end infinite' }}>_</span>
+            <span style={{ color: 'var(--border-active)' }}>{'> '}</span>{transcript}
           </div>
         )}
 
-        {/* User's last transcribed response (shown after processing) */}
-        {!isListening && !isProcessing && transcript && (
-          <div style={{
-            maxWidth: '500px',
-            color: 'var(--text-muted)',
-            fontSize: '13px',
-            lineHeight: '1.6',
-            textAlign: 'center',
-            borderTop: '1px solid var(--border)',
-            paddingTop: '16px',
-          }}>
-            <span style={{ color: 'var(--border-active)' }}>{'>'} </span>
-            {transcript}
-          </div>
-        )}
-
-        {/* Start listening button — shown when AI finishes speaking */}
-        {interviewState === STATES.IDLE && connectionState === 'connected' && (
-          <Button
-            variant="primary"
-            onClick={startListening}
-            style={{ fontSize: '13px', padding: '12px 24px' }}
-          >
-            Start Responding
-          </Button>
-        )}
-
-        {/* Complete state */}
-        {interviewState === STATES.COMPLETE && (
-          <div style={{
-            textAlign: 'center',
-            animation: 'slide-up 0.3s ease',
-          }}>
-            <div style={{ color: 'var(--accent)', fontSize: '14px', marginBottom: '8px' }}>
-              Interview Complete
-            </div>
+        {/* ── COMPLETE ── */}
+        {isComplete && (
+          <div style={{ textAlign: 'center', animation: 'slide-up 0.3s ease' }}>
+            <div style={{ color: 'var(--accent)', fontSize: '14px', marginBottom: '8px' }}>Interview Complete</div>
             <div style={{ color: 'var(--text-muted)', fontSize: '12px' }}>
-              Generating your scorecard
-              <span style={{ animation: 'blink 1s step-end infinite' }}>_</span>
+              Generating your scorecard<span style={{ animation: 'blink 1s step-end infinite' }}>_</span>
             </div>
           </div>
         )}
 
-        {/* Error state */}
-        {interviewState === STATES.ERROR && (
+        {/* ── ERROR ── */}
+        {isError && (
           <div style={{
-            border: '1px solid var(--danger)',
-            padding: '16px 20px',
-            maxWidth: '420px',
-            animation: 'slide-up 0.2s ease',
+            border: '1px solid var(--danger)', padding: '16px 20px',
+            maxWidth: '480px', animation: 'slide-up 0.2s ease',
           }}>
-            <div style={{ color: 'var(--danger)', fontSize: '12px', marginBottom: '8px' }}>
+            <div style={{ color: 'var(--danger)', fontSize: '12px', marginBottom: '12px' }}>
               [!] {errorMessage || 'An error occurred'}
             </div>
-            <Button
-              variant="ghost"
-              onClick={() => navigate('/dashboard')}
-              style={{ fontSize: '12px' }}
-            >
+            <Button variant="ghost" onClick={() => navigate('/dashboard')} style={{ fontSize: '12px' }}>
               ← Back to Dashboard
             </Button>
           </div>
         )}
       </main>
 
-      {/* Bottom controls */}
+      {/* Footer controls */}
       <footer style={{
-        borderTop: '1px solid var(--border)',
-        padding: '16px 24px',
-        display: 'flex',
-        justifyContent: 'center',
-        alignItems: 'center',
-        position: 'relative',
-        zIndex: 1,
+        borderTop: '1px solid var(--border)', padding: '16px 24px',
+        display: 'flex', justifyContent: 'center',
+        position: 'relative', zIndex: 1,
       }}>
         <Controls
           isMuted={isMuted}
           onToggleMute={toggleMute}
           onEndInterview={endInterview}
-          disabled={interviewState === STATES.COMPLETE}
+          disabled={isComplete || isIdle}
         />
       </footer>
     </div>

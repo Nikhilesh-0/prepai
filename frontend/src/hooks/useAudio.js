@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback, useEffect } from 'react'
+import { useRef, useState, useCallback } from 'react'
 
 const SAMPLE_RATE = 44100
 const CHANNELS = 1
@@ -8,44 +8,39 @@ export default function useAudio(sendBinary, sendMessage) {
   const mediaRecorderRef = useRef(null)
   const analyserRef = useRef(null)
   const micStreamRef = useRef(null)
-  const playbackCursorRef = useRef(0) // time cursor for gapless playback
+  const playbackCursorRef = useRef(0)
   const animFrameRef = useRef(null)
+  const suppressSendRef = useRef(false) // when true, don't send chunks to WS
 
   const [isRecording, setIsRecording] = useState(false)
   const [isMuted, setIsMuted] = useState(false)
   const [audioLevel, setAudioLevel] = useState(0)
 
-  // Initialize AudioContext (must be called inside a user gesture)
+  // ── AudioContext init (must be called inside a user gesture) ───────────────
   const initAudioContext = useCallback(() => {
     if (!audioContextRef.current) {
       audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: SAMPLE_RATE,
       })
-      playbackCursorRef.current = 0
     } else if (audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume()
     }
+    playbackCursorRef.current = audioContextRef.current.currentTime
     return audioContextRef.current
   }, [])
 
-  // Start the level meter animation loop
-  const startLevelMeter = useCallback(() => {
-    if (!analyserRef.current) return
-
-    const analyser = analyserRef.current
+  // ── Level meter ────────────────────────────────────────────────────────────
+  const startLevelMeter = useCallback((analyser) => {
     const bufferLength = analyser.fftSize
     const dataArray = new Uint8Array(bufferLength)
-
     const tick = () => {
       analyser.getByteTimeDomainData(dataArray)
-      // Compute RMS
       let sum = 0
       for (let i = 0; i < bufferLength; i++) {
-        const val = (dataArray[i] - 128) / 128
-        sum += val * val
+        const v = (dataArray[i] - 128) / 128
+        sum += v * v
       }
-      const rms = Math.sqrt(sum / bufferLength)
-      setAudioLevel(Math.min(rms * 4, 1)) // scale up for visibility
+      setAudioLevel(Math.min(Math.sqrt(sum / bufferLength) * 4, 1))
       animFrameRef.current = requestAnimationFrame(tick)
     }
     animFrameRef.current = requestAnimationFrame(tick)
@@ -59,117 +54,128 @@ export default function useAudio(sendBinary, sendMessage) {
     setAudioLevel(0)
   }, [])
 
+  // ── requestMicPermission: just opens the mic, immediately closes it ────────
+  // Used as a user-gesture to pre-grant mic access without sending audio
+  const requestMicPermission = useCallback(async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+    // Immediately stop all tracks — we just wanted the permission grant
+    stream.getTracks().forEach(t => t.stop())
+  }, [])
+
+  // ── startRecording ─────────────────────────────────────────────────────────
   const startRecording = useCallback(async () => {
-    try {
-      const ctx = initAudioContext()
-
-      // Get microphone access
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
-      micStreamRef.current = stream
-
-      // Set up analyser for level meter
-      const source = ctx.createMediaStreamSource(stream)
-      const analyser = ctx.createAnalyser()
-      analyser.fftSize = 256
-      source.connect(analyser)
-      analyserRef.current = analyser
-      startLevelMeter()
-
-      // Set up MediaRecorder
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : MediaRecorder.isTypeSupported('audio/webm')
-        ? 'audio/webm'
-        : 'audio/ogg;codecs=opus'
-
-      const recorder = new MediaRecorder(stream, { mimeType })
-      mediaRecorderRef.current = recorder
-
-      recorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0 && !isMuted) {
-          event.data.arrayBuffer().then((buffer) => {
-            sendBinary(buffer)
-          })
-        }
-      }
-
-      recorder.start(250) // fire every 250ms
-      setIsRecording(true)
-    } catch (err) {
-      console.error('Failed to start recording:', err)
-      throw err
-    }
-  }, [initAudioContext, sendBinary, isMuted, startLevelMeter])
-
-  const stopRecording = useCallback(() => {
+    // Stop any existing recording first
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       mediaRecorderRef.current.stop()
     }
-
-    // Stop mic stream tracks
     if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach((track) => track.stop())
+      micStreamRef.current.getTracks().forEach(t => t.stop())
+      micStreamRef.current = null
+    }
+
+    const ctx = audioContextRef.current
+    if (!ctx) throw new Error('AudioContext not initialized. Call initAudioContext first.')
+
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+    micStreamRef.current = stream
+
+    // Level meter
+    const source = ctx.createMediaStreamSource(stream)
+    const analyser = ctx.createAnalyser()
+    analyser.fftSize = 256
+    source.connect(analyser)
+    analyserRef.current = analyser
+    startLevelMeter(analyser)
+
+    // MediaRecorder
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : MediaRecorder.isTypeSupported('audio/webm')
+        ? 'audio/webm'
+        : 'audio/ogg;codecs=opus'
+
+    const recorder = new MediaRecorder(stream, { mimeType })
+    mediaRecorderRef.current = recorder
+
+    recorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0 && !isMuted && !suppressSendRef.current) {
+        event.data.arrayBuffer().then((buffer) => {
+          sendBinary(buffer)
+        })
+      }
+    }
+
+    recorder.start(250)
+    setIsRecording(true)
+  }, [sendBinary, isMuted, startLevelMeter])
+
+  // ── stopRecording ──────────────────────────────────────────────────────────
+  const stopRecording = useCallback((suppress = false) => {
+    if (suppress) suppressSendRef.current = true
+
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop()
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach(t => t.stop())
       micStreamRef.current = null
     }
 
     stopLevelMeter()
     setIsRecording(false)
 
-    // Signal end of audio to backend
-    sendMessage({ type: 'audio_end' })
+    if (!suppress) {
+      sendMessage({ type: 'audio_end' })
+    }
+
+    // Reset suppress flag after a tick
+    if (suppress) {
+      setTimeout(() => { suppressSendRef.current = false }, 100)
+    }
   }, [sendMessage, stopLevelMeter])
 
+  // ── playAudioChunk: decode base64 PCM f32le, schedule gapless ─────────────
   const playAudioChunk = useCallback((base64Audio) => {
     const ctx = audioContextRef.current
     if (!ctx) return
 
     try {
-      // Decode base64 to bytes
-      const binaryStr = atob(base64Audio)
-      const bytes = new Uint8Array(binaryStr.length)
-      for (let i = 0; i < binaryStr.length; i++) {
-        bytes[i] = binaryStr.charCodeAt(i)
-      }
+      if (ctx.state === 'suspended') ctx.resume()
 
-      // PCM f32le — interpret raw bytes as float32 array
-      const float32Array = new Float32Array(bytes.buffer)
-      const numSamples = float32Array.length
+      const binary = atob(base64Audio)
+      const bytes = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
 
-      if (numSamples === 0) return
+      const float32 = new Float32Array(bytes.buffer)
+      if (float32.length === 0) return
 
-      // Create AudioBuffer
-      const audioBuffer = ctx.createBuffer(CHANNELS, numSamples, SAMPLE_RATE)
-      audioBuffer.getChannelData(0).set(float32Array)
+      const buffer = ctx.createBuffer(CHANNELS, float32.length, SAMPLE_RATE)
+      buffer.getChannelData(0).set(float32)
 
-      // Schedule for gapless playback
       const source = ctx.createBufferSource()
-      source.buffer = audioBuffer
+      source.buffer = buffer
       source.connect(ctx.destination)
 
       const now = ctx.currentTime
-      const startTime = Math.max(playbackCursorRef.current, now)
-      source.start(startTime)
-      playbackCursorRef.current = startTime + audioBuffer.duration
-
+      const startAt = Math.max(playbackCursorRef.current, now)
+      source.start(startAt)
+      playbackCursorRef.current = startAt + buffer.duration
     } catch (err) {
-      console.error('Failed to play audio chunk:', err)
+      console.error('Audio playback error:', err)
     }
   }, [])
 
   const resetPlaybackCursor = useCallback(() => {
-    playbackCursorRef.current = 0
     if (audioContextRef.current) {
       playbackCursorRef.current = audioContextRef.current.currentTime
     }
   }, [])
 
-  const toggleMute = useCallback(() => {
-    setIsMuted((prev) => !prev)
-  }, [])
+  const toggleMute = useCallback(() => setIsMuted(p => !p), [])
 
-  // Expose initAudioContext so Interview page can call it on button click
   return {
     initAudioContext,
+    requestMicPermission,
     startRecording,
     stopRecording,
     playAudioChunk,
