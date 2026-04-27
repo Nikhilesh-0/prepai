@@ -186,6 +186,16 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                     await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
                     continue
 
+                # Minimum size check — tiny buffers are just mic noise, not speech.
+                # A valid WebM file with actual speech is typically > 2KB.
+                if len(audio_buffer) < 2000:
+                    print(f"[WS] audio buffer too small ({len(audio_buffer)} bytes) — treating as silence")
+                    audio_buffer.clear()
+                    await session_manager.update_session(session_id, {"is_listening": True})
+                    await send_json(ws, {"type": "speaking_done"})
+                    await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
+                    continue
+
                 await session_manager.update_session(session_id, {"is_listening": False})
                 await send_json(ws, {"type": "processing_start"})
 
@@ -262,14 +272,24 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                         break
 
                 except Exception as e:
-                    print(f"[WS] audio_end processing error: {e}")
-                    traceback.print_exc()
+                    error_str = str(e).lower()
                     audio_buffer.clear()
-                    await send_json(ws, {"type": "error", "message": f"Processing failed: {str(e)}"})
-                    # Restart listening so user isn't stuck
-                    await session_manager.update_session(session_id, {"is_listening": True})
-                    await send_json(ws, {"type": "speaking_done"})
-                    await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
+
+                    # Groq can't parse the audio file — treat as "no speech"
+                    if "could not process file" in error_str or "invalid" in error_str:
+                        print(f"[WS] Invalid audio file sent to STT — treating as silence")
+                        await session_manager.update_session(session_id, {"is_listening": True})
+                        await send_json(ws, {"type": "speaking_done"})
+                        await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
+                    else:
+                        print(f"[WS] audio_end processing error: {e}")
+                        traceback.print_exc()
+                        await send_json(ws, {"type": "error", "message": "Could not process audio. Please try again."})
+                        # Restart listening so user isn't stuck
+                        await session_manager.update_session(session_id, {"is_listening": True})
+                        await send_json(ws, {"type": "speaking_done"})
+                        await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
+
 
             elif msg_type == "end_interview":
                 try:
