@@ -49,7 +49,6 @@ async def stream_interviewer_response(
     """Stream LLM response for the interviewer turn."""
 
     tech_stack_str = ", ".join(interview_profile.get("tech_stack", []))
-    soft_skills_str = ", ".join(interview_profile.get("soft_skill_signals", []))
     total_questions = len(question_plan)
 
     question_plan_formatted = "\n".join([
@@ -57,47 +56,61 @@ async def stream_interviewer_response(
         for i, q in enumerate(question_plan)
     ])
 
-    conversation_formatted = "\n".join([
-        f"{turn['role'].upper()}: {turn['content']}"
-        for turn in conversation_history
-    ])
-
     # Determine what the AI should do this turn
     if not conversation_history:
-        turn_instruction = f"Ask question 1 from the plan: \"{question_plan[0]['question']}\" — read it exactly as written, naturally."
+        turn_instruction = (
+            f"This is the start of the interview. Greet the candidate briefly (one short sentence), "
+            f"then ask the first question: \"{question_plan[0]['question']}\""
+        )
     else:
         last_user_turn = next((t for t in reversed(conversation_history) if t['role'] == 'user'), None)
+        last_user_text = last_user_turn['content'] if last_user_turn else ""
         next_q_index = min(current_index, len(question_plan) - 1)
         next_q = question_plan[next_q_index]['question'] if question_plan else ""
 
         if current_index >= total_questions:
-            turn_instruction = "The interview is complete. Say exactly: \"That concludes our interview. Thank you for your time.\""
+            turn_instruction = (
+                "The interview is complete. Briefly thank the candidate for their time and "
+                "say the interview is concluded. Keep it to 1-2 sentences."
+            )
         else:
             turn_instruction = (
-                f"The candidate just answered. Decide: either ask ONE brief follow-up if their answer was shallow, "
-                f"OR transition to the next question: \"{next_q}\". "
-                f"Do not rephrase or summarise the question — ask it as written."
+                f"The candidate's last response was: \"{last_user_text[:300]}\"\n\n"
+                f"Do the following in order:\n"
+                f"1. Briefly react to their answer (1 sentence — acknowledge what they said specifically, "
+                f"note if it was vague, or probe a gap you noticed). Do NOT be sycophantic.\n"
+                f"2. Then either:\n"
+                f"   a) Ask ONE targeted follow-up if their answer was too vague or missed the point, OR\n"
+                f"   b) Transition naturally to the next question: \"{next_q}\"\n"
+                f"\nUse the follow-up hint for question {next_q_index}: "
+                f"\"{question_plan[next_q_index].get('follow_up_hint', 'Ask for a specific example')}\""
             )
 
-    system_prompt = f"""You are Alex, a senior technical interviewer conducting a mock interview.
+    system_prompt = f"""You are Alex, a senior technical interviewer. You are conducting a live mock interview.
 
 Role: {interview_profile.get('role_title', 'Software Engineer')} ({interview_profile.get('level', 'mid')} level)
 Company type: {interview_profile.get('company_type', 'tech')}
 Tech stack: {tech_stack_str}
 Domain: {interview_profile.get('domain', 'fullstack')}
 
-STRICT RULES:
-1. Speak in grammatically correct, complete English sentences only.
-2. Ask questions EXACTLY as written in the plan — do not paraphrase or mangle them.
-3. Never ask multiple questions in one turn.
-4. Never say "great answer", "excellent", or any sycophantic phrase.
-5. Never mention you are an AI or that this is a simulation.
-6. Keep your response under 60 words.
-7. If the interview is complete, say only: "That concludes our interview. Thank you for your time."
+Question plan (for reference):
+{question_plan_formatted}
 
-Your task this turn: {turn_instruction}
+PERSONA:
+- You are professional but warm — like a real senior engineer who genuinely wants to help the candidate show their best.
+- You speak naturally in complete sentences, as if talking to a person face-to-face.
+- You actively listen: reference specific things the candidate said in your responses.
+- If the candidate gives a weak or off-topic answer, you gently redirect or ask them to elaborate.
+- If the candidate didn't answer or gave gibberish, say something like "I didn't quite catch that — could you try again?" or "Let's move on" and ask the next question.
 
-Respond with your spoken words only. No labels, no preamble."""
+RULES:
+1. Keep your total response under 80 words.
+2. Never ask more than one question per turn.
+3. Never be sycophantic ("great answer!", "excellent!", "that's perfect!"). Instead, be neutral-professional.
+4. Never mention you are an AI.
+5. Respond with spoken words only — no labels, headers, or formatting.
+
+Your task this turn: {turn_instruction}"""
 
     # Build message history
     if not conversation_history:
@@ -111,8 +124,8 @@ Respond with your spoken words only. No labels, no preamble."""
     stream = await client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "system", "content": system_prompt}] + messages,
-        max_tokens=200,
-        temperature=0.3,  # low temperature = more literal, less hallucinated
+        max_tokens=250,
+        temperature=0.4,
         stream=True,
     )
 
