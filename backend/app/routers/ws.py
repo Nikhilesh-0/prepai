@@ -153,6 +153,8 @@ async def interview_websocket(ws: WebSocket, session_id: str):
     await ws.accept()
 
     audio_buffer = bytearray()
+    failed_listen_attempts = 0  # tracks consecutive failed transcriptions per question
+    MAX_LISTEN_RETRIES = 3
 
     session = await session_manager.get_session(session_id)
     if not session:
@@ -161,6 +163,63 @@ async def interview_websocket(ws: WebSocket, session_id: str):
         return
 
     await send_json(ws, build_state_update(session))
+
+    # Helper: handle the case where we couldn't get valid audio
+    async def handle_failed_listen():
+        nonlocal failed_listen_attempts
+        failed_listen_attempts += 1
+
+        if failed_listen_attempts >= MAX_LISTEN_RETRIES:
+            # Give up — record a "no response" and advance to next question
+            failed_listen_attempts = 0
+            await session_manager.add_conversation_turn(session_id, "user", "(no response)")
+
+            current_session = await session_manager.get_session(session_id)
+            old_index = current_session["current_question_index"]
+            total = current_session["total_questions"]
+            await session_manager.increment_question_index(session_id)
+
+            is_last = old_index >= total - 1
+
+            await handle_ai_turn(ws, session_id)
+
+            if is_last:
+                await send_json(ws, {"type": "processing_start"})
+                final_session = await session_manager.get_session(session_id)
+
+                scorecard_data = await generate_scorecard(
+                    conversation_history=final_session["conversation_history"],
+                    interview_profile=final_session["interview_profile"],
+                    filler_counts=final_session.get("filler_word_counts", []),
+                )
+                scorecard_data["session_id"] = session_id
+
+                try:
+                    await supabase_service.save_scorecard(scorecard_data)
+                    await supabase_service.update_session_status(
+                        session_id, "completed", datetime.now(timezone.utc)
+                    )
+                except Exception:
+                    pass
+
+                await send_json(ws, {
+                    "type": "interview_complete",
+                    "session_id": session_id,
+                    "scorecard": scorecard_data,
+                })
+                return False  # signal to break from main loop
+        else:
+            # Still have retries — tell the user and restart listening
+            remaining = MAX_LISTEN_RETRIES - failed_listen_attempts
+            await send_json(ws, {
+                "type": "error",
+                "message": f"I couldn't hear you clearly — please try again. ({remaining} attempt{'s' if remaining != 1 else ''} left)",
+            })
+            await session_manager.update_session(session_id, {"is_listening": True})
+            await send_json(ws, {"type": "speaking_done"})
+            await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
+
+        return True  # signal to continue main loop
 
     try:
         while True:
@@ -197,21 +256,19 @@ async def interview_websocket(ws: WebSocket, session_id: str):
 
             if msg_type == "audio_end":
                 if len(audio_buffer) == 0:
-                    # Empty buffer — just restart listening without error
-                    print("[WS] audio_end received but buffer is empty — re-signaling listen")
-                    await session_manager.update_session(session_id, {"is_listening": True})
-                    await send_json(ws, {"type": "speaking_done"})
-                    await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
+                    print("[WS] audio_end received but buffer is empty")
+                    should_continue = await handle_failed_listen()
+                    if not should_continue:
+                        break
                     continue
 
                 # Minimum size check — tiny buffers are just mic noise, not speech.
-                # A valid WebM file with actual speech is typically > 2KB.
                 if len(audio_buffer) < 2000:
-                    print(f"[WS] audio buffer too small ({len(audio_buffer)} bytes) — treating as silence")
+                    print(f"[WS] audio buffer too small ({len(audio_buffer)} bytes)")
                     audio_buffer.clear()
-                    await session_manager.update_session(session_id, {"is_listening": True})
-                    await send_json(ws, {"type": "speaking_done"})
-                    await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
+                    should_continue = await handle_failed_listen()
+                    if not should_continue:
+                        break
                     continue
 
                 await session_manager.update_session(session_id, {"is_listening": False})
@@ -224,12 +281,14 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                     transcript = await transcribe_audio(audio_bytes, "audio/webm")
 
                     if not transcript or not transcript.strip():
-                        # No speech detected — restart listening silently
-                        print("[WS] Empty transcript — restarting listen")
-                        await session_manager.update_session(session_id, {"is_listening": True})
-                        await send_json(ws, {"type": "speaking_done"})
-                        await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
+                        print("[WS] Empty transcript")
+                        should_continue = await handle_failed_listen()
+                        if not should_continue:
+                            break
                         continue
+
+                    # SUCCESS — reset retry counter
+                    failed_listen_attempts = 0
 
                     await send_json(ws, {"type": "transcript", "text": transcript})
 
@@ -293,20 +352,19 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                     error_str = str(e).lower()
                     audio_buffer.clear()
 
-                    # Groq can't parse the audio file — treat as "no speech"
+                    # Groq can't parse the audio file — treat as failed listen
                     if "could not process file" in error_str or "invalid" in error_str:
-                        print(f"[WS] Invalid audio file sent to STT — treating as silence")
-                        await session_manager.update_session(session_id, {"is_listening": True})
-                        await send_json(ws, {"type": "speaking_done"})
-                        await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
+                        print(f"[WS] Invalid audio file sent to STT")
+                        should_continue = await handle_failed_listen()
+                        if not should_continue:
+                            break
                     else:
                         print(f"[WS] audio_end processing error: {e}")
                         traceback.print_exc()
-                        await send_json(ws, {"type": "error", "message": "Could not process audio. Please try again."})
-                        # Restart listening so user isn't stuck
-                        await session_manager.update_session(session_id, {"is_listening": True})
-                        await send_json(ws, {"type": "speaking_done"})
-                        await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
+                        should_continue = await handle_failed_listen()
+                        if not should_continue:
+                            break
+
 
 
             elif msg_type == "end_interview":
