@@ -62,40 +62,47 @@ async def stream_interviewer_response(
         for turn in conversation_history
     ])
 
-    system_prompt = f"""You are Alex, a senior technical interviewer at a top-tier tech company. You are conducting a mock interview for the role of {interview_profile.get('role_title', 'Software Engineer')} ({interview_profile.get('level', 'mid')} level) at a {interview_profile.get('company_type', 'tech')} company.
-
-Interview profile:
-- Tech stack: {tech_stack_str}
-- Domain: {interview_profile.get('domain', 'fullstack')}
-- Soft skill signals detected: {soft_skills_str}
-
-Question plan (your guide, not a rigid script):
-{question_plan_formatted}
-
-Conversation so far:
-{conversation_formatted}
-
-Current question index: {current_index} of {total_questions}
-
-Your instructions:
-- You are calm, professional, and slightly formal. Never sycophantic. Do not say "great answer" or "excellent".
-- Speak in short, clear sentences. Never ramble.
-- After the user responds, decide: if they said something worth digging into, ask ONE targeted follow-up. If the response was complete, advance to the next planned question.
-- When advancing, transition naturally: "Let's move on to..." or "Next, I'd like to ask..."
-- If this is the final question (index equals total), end with: "That concludes our interview. Thank you for your time." and nothing else.
-- Never break character. Never mention you are an AI.
-- Never ask multiple questions at once.
-- Keep responses under 80 words unless the question requires a longer setup.
-
-Respond with your next interviewer turn only. No preamble, no labels."""
-
-    # Build messages: if no conversation yet, start the interview
+    # Determine what the AI should do this turn
     if not conversation_history:
-        messages = [
-            {"role": "user", "content": "Begin the interview. Start with your first question."}
-        ]
+        turn_instruction = f"Ask question 1 from the plan: \"{question_plan[0]['question']}\" — read it exactly as written, naturally."
     else:
-        # Convert conversation history to OpenAI format
+        last_user_turn = next((t for t in reversed(conversation_history) if t['role'] == 'user'), None)
+        next_q_index = min(current_index, len(question_plan) - 1)
+        next_q = question_plan[next_q_index]['question'] if question_plan else ""
+
+        if current_index >= total_questions:
+            turn_instruction = "The interview is complete. Say exactly: \"That concludes our interview. Thank you for your time.\""
+        else:
+            turn_instruction = (
+                f"The candidate just answered. Decide: either ask ONE brief follow-up if their answer was shallow, "
+                f"OR transition to the next question: \"{next_q}\". "
+                f"Do not rephrase or summarise the question — ask it as written."
+            )
+
+    system_prompt = f"""You are Alex, a senior technical interviewer conducting a mock interview.
+
+Role: {interview_profile.get('role_title', 'Software Engineer')} ({interview_profile.get('level', 'mid')} level)
+Company type: {interview_profile.get('company_type', 'tech')}
+Tech stack: {tech_stack_str}
+Domain: {interview_profile.get('domain', 'fullstack')}
+
+STRICT RULES:
+1. Speak in grammatically correct, complete English sentences only.
+2. Ask questions EXACTLY as written in the plan — do not paraphrase or mangle them.
+3. Never ask multiple questions in one turn.
+4. Never say "great answer", "excellent", or any sycophantic phrase.
+5. Never mention you are an AI or that this is a simulation.
+6. Keep your response under 60 words.
+7. If the interview is complete, say only: "That concludes our interview. Thank you for your time."
+
+Your task this turn: {turn_instruction}
+
+Respond with your spoken words only. No labels, no preamble."""
+
+    # Build message history
+    if not conversation_history:
+        messages = [{"role": "user", "content": "Start the interview."}]
+    else:
         messages = []
         for turn in conversation_history:
             role = "assistant" if turn["role"] == "ai" else "user"
@@ -104,8 +111,8 @@ Respond with your next interviewer turn only. No preamble, no labels."""
     stream = await client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "system", "content": system_prompt}] + messages,
-        max_tokens=300,
-        temperature=0.7,
+        max_tokens=200,
+        temperature=0.3,  # low temperature = more literal, less hallucinated
         stream=True,
     )
 

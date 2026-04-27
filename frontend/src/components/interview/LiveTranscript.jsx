@@ -1,47 +1,59 @@
 import React, { useEffect, useState, useRef } from 'react'
 
 export default function LiveTranscript({ text = '', isStreaming = false }) {
+  // While streaming: show the full accumulated text as-is (no typewriter delay on tokens)
+  // After streaming ends (isStreaming=false, text stable): keep showing full text
+  // On reset (text goes to '' then new text): fade out then typewrite new text
   const [displayed, setDisplayed] = useState('')
-  const [charIndex, setCharIndex] = useState(0)
   const intervalRef = useRef(null)
   const prevTextRef = useRef('')
+  const isTypingRef = useRef(false)
 
   useEffect(() => {
-    // When new text arrives (longer than before), type out the new characters
-    if (text.length > prevTextRef.current.length && text.startsWith(prevTextRef.current)) {
-      // Append mode — continue from where we left off
-      prevTextRef.current = text
-    } else if (text !== prevTextRef.current) {
-      // Reset — new question
+    // Text reset — new question starting
+    if (text === '' && prevTextRef.current !== '') {
+      clearInterval(intervalRef.current)
       setDisplayed('')
-      setCharIndex(0)
-      prevTextRef.current = text
-    }
-  }, [text])
-
-  useEffect(() => {
-    if (!text) {
-      setDisplayed('')
+      prevTextRef.current = ''
+      isTypingRef.current = false
       return
     }
 
-    if (displayed.length >= text.length) return
+    if (!text) return
 
-    clearInterval(intervalRef.current)
-    intervalRef.current = setInterval(() => {
-      setDisplayed(prev => {
-        if (prev.length >= text.length) {
+    // Same text, no change
+    if (text === prevTextRef.current) return
+
+    prevTextRef.current = text
+
+    // While AI is streaming tokens: just display the full buffer immediately.
+    // This avoids the garbled look from typewriter racing behind fast token arrival.
+    if (isStreaming) {
+      setDisplayed(text)
+      return
+    }
+
+    // Streaming finished — typewrite the complete final text from the start
+    // (only triggered once when isStreaming flips to false)
+    if (!isTypingRef.current) {
+      isTypingRef.current = true
+      setDisplayed('')
+      let i = 0
+      clearInterval(intervalRef.current)
+      intervalRef.current = setInterval(() => {
+        i++
+        setDisplayed(text.slice(0, i))
+        if (i >= text.length) {
           clearInterval(intervalRef.current)
-          return prev
+          isTypingRef.current = false
         }
-        return text.slice(0, prev.length + 1)
-      })
-    }, 15)
+      }, 18)
+    }
 
     return () => clearInterval(intervalRef.current)
-  }, [text, displayed.length])
+  }, [text, isStreaming])
 
-  const showCursor = isStreaming || displayed.length < text.length
+  const showCursor = isStreaming || isTypingRef.current
 
   return (
     <div style={{
