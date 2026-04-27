@@ -124,17 +124,12 @@ export default function useInterview(sessionId) {
       }
 
       case 'error': {
-        // Show error message but DON'T crash to error state for recoverable errors
-        // (empty audio, transcription hiccup). Just log it.
+        // Log but don't crash — backend now always follows errors with speaking_done
+        // which will trigger doStartListening(). Just surface the message.
         console.warn('WS error:', msg.message)
         setErrorMessage(msg.message)
-        // If we were processing, go back to listening
-        if (startedRef.current && !listeningRef.current) {
-          setTimeout(() => {
-            listeningRef.current = false
-            doStartListening()
-          }, 1200)
-        }
+        // Clear error message after 4s so it doesn't persist on screen
+        setTimeout(() => setErrorMessage(''), 4000)
         break
       }
 

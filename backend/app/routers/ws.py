@@ -1,6 +1,7 @@
 import json
 import base64
 import asyncio
+import traceback
 from datetime import datetime, timezone
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from app.core.session_manager import session_manager
@@ -32,13 +33,26 @@ async def send_json(ws: WebSocket, data: dict):
         pass
 
 
+async def tts_for_sentence(sentence: str) -> bytes:
+    """
+    Run TTS for one sentence. Returns bytes or empty bytes on failure.
+    Never raises — callers must not be interrupted by TTS errors.
+    """
+    try:
+        audio = b""
+        async for chunk in stream_tts(sentence):
+            audio += chunk
+        return audio
+    except Exception as e:
+        print(f"[TTS ERROR] sentence='{sentence[:40]}...' err={e}")
+        traceback.print_exc()
+        return b""
+
+
 async def handle_ai_turn(ws: WebSocket, session_id: str):
     """
-    Run one full AI turn:
-      1. Stream LLM text, split at sentence boundaries
-      2. Send each sentence to Cartesia TTS
-      3. Stream text chunks + base64 audio chunks to client
-      4. Send speaking_done when all audio is sent
+    Run one full AI turn. Always sends speaking_done at the end,
+    even if TTS fails — that way the frontend never gets stuck.
     """
     session = await session_manager.get_session(session_id)
     if not session:
@@ -50,6 +64,7 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
 
     full_response = ""
     sentence_buffer = ""
+    tts_failed = False
 
     try:
         async for text_chunk in stream_interviewer_response(
@@ -61,54 +76,58 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
             full_response += text_chunk
             sentence_buffer += text_chunk
 
-            # Send text chunk for live typewriter display
+            # Stream text to frontend immediately for typewriter display
             await send_json(ws, {"type": "ai_text_chunk", "text": text_chunk})
 
-            # Flush complete sentences to TTS as they arrive
+            # Send complete sentences to TTS as they form
             sentences = split_into_tts_chunks(sentence_buffer)
             if len(sentences) > 1:
                 for sentence in sentences[:-1]:
-                    if sentence.strip():
-                        audio_bytes = b""
-                        async for chunk in stream_tts(sentence.strip()):
-                            audio_bytes += chunk
-                        if audio_bytes:
+                    s = sentence.strip()
+                    if s:
+                        audio = await tts_for_sentence(s)
+                        if audio:
                             await send_json(ws, {
                                 "type": "audio_response_chunk",
-                                "audio": base64.b64encode(audio_bytes).decode("utf-8"),
+                                "audio": base64.b64encode(audio).decode("utf-8"),
                             })
+                        else:
+                            tts_failed = True
                 sentence_buffer = sentences[-1]
 
-        # Flush remaining text
+        # Flush last sentence
         if sentence_buffer.strip():
-            audio_bytes = b""
-            async for chunk in stream_tts(sentence_buffer.strip()):
-                audio_bytes += chunk
-            if audio_bytes:
+            audio = await tts_for_sentence(sentence_buffer.strip())
+            if audio:
                 await send_json(ws, {
                     "type": "audio_response_chunk",
-                    "audio": base64.b64encode(audio_bytes).decode("utf-8"),
+                    "audio": base64.b64encode(audio).decode("utf-8"),
                 })
-
-        # Save AI turn to conversation history
-        await session_manager.add_conversation_turn(session_id, "ai", full_response)
-
-        # Signal client that all audio has been sent
-        await send_json(ws, {"type": "speaking_done"})
-
-        # Update state: AI done, now listening
-        await session_manager.update_session(session_id, {
-            "is_ai_speaking": False,
-            "is_listening": True,
-        })
-        await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
+            else:
+                tts_failed = True
 
     except Exception as e:
-        await send_json(ws, {"type": "error", "message": f"AI turn failed: {str(e)}"})
-        await session_manager.update_session(session_id, {
-            "is_ai_speaking": False,
-            "is_listening": True,
-        })
+        # LLM streaming failed — still need to unblock the frontend
+        print(f"[LLM ERROR] {e}")
+        traceback.print_exc()
+        full_response = full_response or "I encountered an issue. Let's continue — please go ahead."
+        await send_json(ws, {"type": "error", "message": f"LLM error: {str(e)}"})
+
+    # Save whatever response we got
+    if full_response:
+        await session_manager.add_conversation_turn(session_id, "ai", full_response)
+
+    if tts_failed:
+        await send_json(ws, {"type": "error", "message": "Audio unavailable — reading text only"})
+
+    # ALWAYS send speaking_done so the frontend can transition to listening
+    await send_json(ws, {"type": "speaking_done"})
+
+    await session_manager.update_session(session_id, {
+        "is_ai_speaking": False,
+        "is_listening": True,
+    })
+    await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
 
 
 @router.websocket("/ws/interview/{session_id}")
@@ -123,13 +142,7 @@ async def interview_websocket(ws: WebSocket, session_id: str):
         await ws.close()
         return
 
-    # Send initial state so frontend knows the session exists
     await send_json(ws, build_state_update(session))
-
-    # ── Wait for client to signal it is ready before starting AI ──────────────
-    # This decouples AudioContext/mic initialisation (user gesture) from WS connect.
-    # Client sends {"type": "client_ready"} after beginInterview() succeeds.
-    client_ready = False
 
     try:
         while True:
@@ -141,12 +154,10 @@ async def interview_websocket(ws: WebSocket, session_id: str):
             if message["type"] == "websocket.disconnect":
                 return
 
-            # Binary audio chunk — accumulate
             if "bytes" in message and message["bytes"] is not None:
                 audio_buffer.extend(message["bytes"])
                 continue
 
-            # Text / JSON message
             if "text" not in message or not message["text"]:
                 continue
 
@@ -158,9 +169,7 @@ async def interview_websocket(ws: WebSocket, session_id: str):
 
             msg_type = data.get("type")
 
-            # ── Client signals it is ready → fire first AI turn ───────────────
-            if msg_type == "client_ready" and not client_ready:
-                client_ready = True
+            if msg_type == "client_ready":
                 await handle_ai_turn(ws, session_id)
                 continue
 
@@ -168,12 +177,12 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                 await send_json(ws, {"type": "pong"})
                 continue
 
-            # ── End of user audio → transcribe → AI responds ──────────────────
             if msg_type == "audio_end":
                 if len(audio_buffer) == 0:
-                    await send_json(ws, {"type": "error", "message": "No audio received"})
-                    # Re-signal listening so client can try again
+                    # Empty buffer — just restart listening without error
+                    print("[WS] audio_end received but buffer is empty — re-signaling listen")
                     await session_manager.update_session(session_id, {"is_listening": True})
+                    await send_json(ws, {"type": "speaking_done"})
                     await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
                     continue
 
@@ -187,26 +196,24 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                     transcript = await transcribe_audio(audio_bytes, "audio/webm")
 
                     if not transcript or not transcript.strip():
-                        await send_json(ws, {"type": "error", "message": "Could not transcribe audio. Please speak clearly and try again."})
+                        # No speech detected — restart listening silently
+                        print("[WS] Empty transcript — restarting listen")
                         await session_manager.update_session(session_id, {"is_listening": True})
+                        await send_json(ws, {"type": "speaking_done"})
                         await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
                         continue
 
                     await send_json(ws, {"type": "transcript", "text": transcript})
 
-                    # Count filler words
                     filler_count = count_filler_words(transcript)
-
-                    # Save user turn
                     await session_manager.add_conversation_turn(session_id, "user", transcript)
 
-                    # Update filler counts
                     current_session = await session_manager.get_session(session_id)
                     filler_counts = current_session.get("filler_word_counts", [])
                     filler_counts.append(filler_count)
                     await session_manager.update_session(session_id, {"filler_word_counts": filler_counts})
 
-                    # Persist response to Supabase (non-blocking, ignore failures)
+                    # Persist to Supabase (fire and forget)
                     try:
                         question_ids = await supabase_service.get_question_ids(session_id)
                         current_idx = current_session["current_question_index"]
@@ -219,20 +226,16 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                     except Exception:
                         pass
 
-                    # Advance question index
                     current_session = await session_manager.get_session(session_id)
                     old_index = current_session["current_question_index"]
                     total = current_session["total_questions"]
                     await session_manager.increment_question_index(session_id)
 
-                    # Check if interview is done
                     is_last = old_index >= total - 1
 
-                    # AI responds (closing remark if last question)
                     await handle_ai_turn(ws, session_id)
 
                     if is_last:
-                        # Generate and save scorecard
                         await send_json(ws, {"type": "processing_start"})
                         final_session = await session_manager.get_session(session_id)
 
@@ -259,9 +262,13 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                         break
 
                 except Exception as e:
+                    print(f"[WS] audio_end processing error: {e}")
+                    traceback.print_exc()
                     audio_buffer.clear()
                     await send_json(ws, {"type": "error", "message": f"Processing failed: {str(e)}"})
+                    # Restart listening so user isn't stuck
                     await session_manager.update_session(session_id, {"is_listening": True})
+                    await send_json(ws, {"type": "speaking_done"})
                     await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
 
             elif msg_type == "end_interview":

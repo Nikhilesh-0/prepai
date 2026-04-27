@@ -173,7 +173,7 @@ export default function Interview() {
           </div>
         )}
 
-        {/* ── ERROR ── */}
+        {/* ── ERROR (fatal only — mic denied etc) ── */}
         {isError && (
           <div style={{
             border: '1px solid var(--danger)', padding: '16px 20px',
@@ -185,6 +185,18 @@ export default function Interview() {
             <Button variant="ghost" onClick={() => navigate('/dashboard')} style={{ fontSize: '12px' }}>
               ← Back to Dashboard
             </Button>
+          </div>
+        )}
+
+        {/* ── Non-fatal error toast (TTS unavailable, etc) ── */}
+        {!isError && errorMessage && (
+          <div style={{
+            position: 'fixed', bottom: '80px', left: '50%', transform: 'translateX(-50%)',
+            background: 'var(--bg-tertiary)', border: '1px solid var(--border-active)',
+            padding: '8px 16px', fontSize: '11px', color: 'var(--text-muted)',
+            whiteSpace: 'nowrap', zIndex: 10,
+          }}>
+            {errorMessage}
           </div>
         )}
       </main>
