@@ -27,13 +27,13 @@ export default function Scorecard() {
       try {
         // Retry up to 3 times — scorecard may still be generating
         let data = null
-        for (let i = 0; i < 3; i++) {
+        for (let i = 0; i < 5; i++) {
           try {
             data = await getScorecard(sessionId)
             if (data) break
           } catch (e) {
-            if (i < 2) {
-              await new Promise(r => setTimeout(r, 2000))
+            if (i < 4) {
+              await new Promise(r => setTimeout(r, 3000))
             } else {
               throw e
             }

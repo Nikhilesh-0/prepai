@@ -39,6 +39,7 @@ export default function useInterview(sessionId) {
     stopRecording,
     playAudioChunk,
     resetPlaybackCursor,
+    getRemainingPlaybackMs,
     isMuted,
     toggleMute,
     isRecording,
@@ -49,9 +50,11 @@ export default function useInterview(sessionId) {
   const startRecordingRef = useRef(startRecording)
   const resetPlaybackCursorRef = useRef(resetPlaybackCursor)
   const playAudioChunkRef = useRef(playAudioChunk)
+  const getRemainingPlaybackMsRef = useRef(getRemainingPlaybackMs)
   useEffect(() => { startRecordingRef.current = startRecording }, [startRecording])
   useEffect(() => { resetPlaybackCursorRef.current = resetPlaybackCursor }, [resetPlaybackCursor])
   useEffect(() => { playAudioChunkRef.current = playAudioChunk }, [playAudioChunk])
+  useEffect(() => { getRemainingPlaybackMsRef.current = getRemainingPlaybackMs }, [getRemainingPlaybackMs])
 
   useEffect(() => { onBinary(() => { }) }, [onBinary])
 
@@ -98,11 +101,16 @@ export default function useInterview(sessionId) {
         case 'speaking_done': {
           // Clear any pending timer
           if (speakingDoneTimerRef.current) clearTimeout(speakingDoneTimerRef.current)
-          // Wait for audio to finish playing (~1.2s), then start listening
+
+          // Calculate actual remaining playback time instead of guessing
+          const remainingMs = getRemainingPlaybackMsRef.current()
+          // Add 800ms buffer after audio finishes, minimum 1200ms total
+          const delay = Math.max(remainingMs + 800, 1200)
+
           speakingDoneTimerRef.current = setTimeout(() => {
             listeningRef.current = false
             triggerListening()
-          }, 1200)
+          }, delay)
           break
         }
 

@@ -194,6 +194,16 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     }
   }, [])
 
+  // ── getRemainingPlaybackMs ─────────────────────────────────────────────────
+  // Returns how many milliseconds of audio are still queued for playback.
+  // Used to delay mic activation until the AI finishes speaking audibly.
+  const getRemainingPlaybackMs = useCallback(() => {
+    const ctx = audioContextRef.current
+    if (!ctx) return 0
+    const remaining = playbackCursorRef.current - ctx.currentTime
+    return Math.max(0, remaining * 1000)
+  }, [])
+
   const toggleMute = useCallback(() => setIsMutedWrapped(p => !p), [setIsMutedWrapped])
 
   return {
@@ -203,6 +213,7 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     stopRecording,
     playAudioChunk,
     resetPlaybackCursor,
+    getRemainingPlaybackMs,
     isMuted,
     toggleMute,
     isRecording,

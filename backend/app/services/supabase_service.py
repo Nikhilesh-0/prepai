@@ -111,16 +111,16 @@ async def get_user_sessions(user_id: str) -> list:
 
 
 async def get_scorecard(session_id: str) -> Optional[dict]:
-    """Return the scorecard for a session."""
+    """Return the scorecard for a session, or None if not yet generated."""
     client = get_client()
     response = (
         client.table("scorecards")
         .select("*")
         .eq("session_id", session_id)
-        .single()
+        .limit(1)
         .execute()
     )
-    return response.data
+    return response.data[0] if response.data else None
 
 
 async def get_question_ids(session_id: str) -> list:

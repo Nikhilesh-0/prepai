@@ -273,7 +273,25 @@ async def interview_websocket(ws: WebSocket, session_id: str):
 
             elif msg_type == "end_interview":
                 try:
-                    await supabase_service.update_session_status(session_id, "abandoned")
+                    # Try to generate a partial scorecard if there's conversation history
+                    final_session = await session_manager.get_session(session_id)
+                    if final_session and len(final_session.get("conversation_history", [])) > 1:
+                        try:
+                            scorecard_data = await generate_scorecard(
+                                conversation_history=final_session["conversation_history"],
+                                interview_profile=final_session["interview_profile"],
+                                filler_counts=final_session.get("filler_word_counts", []),
+                            )
+                            scorecard_data["session_id"] = session_id
+                            await supabase_service.save_scorecard(scorecard_data)
+                            await supabase_service.update_session_status(
+                                session_id, "completed", datetime.now(timezone.utc)
+                            )
+                        except Exception as e:
+                            print(f"[WS] Failed to generate partial scorecard: {e}")
+                            await supabase_service.update_session_status(session_id, "abandoned")
+                    else:
+                        await supabase_service.update_session_status(session_id, "abandoned")
                 except Exception:
                     pass
                 await send_json(ws, {"type": "interview_complete", "session_id": session_id})
