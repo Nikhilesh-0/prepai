@@ -3,7 +3,6 @@ import re
 from typing import AsyncGenerator
 from groq import AsyncGroq
 from app.core.config import settings
-from app.services.jd_profile_model import infer_jd_profile
 
 client = AsyncGroq(api_key=settings.groq_api_key)
 
@@ -29,11 +28,6 @@ ABBREVIATIONS = {
 
 async def parse_jd(jd_text: str) -> dict:
     """Parse a job description and extract structured interview profile."""
-    local_profile = infer_jd_profile(jd_text)
-    if local_profile.get("_local_model_confidence", 0) >= 0.62:
-        local_profile.pop("_local_model_confidence", None)
-        return local_profile
-
     prompt = f"""Analyze this job description and extract key information for interview preparation.
 
 Job Description:
