@@ -131,6 +131,77 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
 
 
 
+async def restore_session_from_db(session_id: str) -> bool:
+    try:
+        client = supabase_service.get_client()
+        session_res = client.table("sessions").select("*").eq("id", session_id).execute()
+        if not session_res.data:
+            return False
+        session_data = session_res.data[0]
+
+        if session_data["status"] != "in_progress":
+            return False
+
+        questions_res = client.table("questions").select("*").eq("session_id", session_id).order("order_index").execute()
+        if not questions_res.data:
+            return False
+        questions = questions_res.data
+
+        responses_res = client.table("responses").select("*").eq("session_id", session_id).execute()
+        responses = responses_res.data or []
+
+        current_index = len(responses)
+        if current_index >= len(questions):
+            return False
+
+        interview_profile = {
+            "role_title": session_data.get("role_title"),
+            "level": session_data.get("level"),
+            "domain": session_data.get("domain"),
+            "tech_stack": session_data.get("tech_stack", []),
+        }
+
+        question_plan = []
+        for q in questions:
+            question_plan.append({
+                "question": q["question_text"],
+                "type": q["question_type"],
+                "follow_up_hint": q.get("follow_up_hint"),
+            })
+
+        await session_manager.create_session(
+            session_id=session_id,
+            user_id=session_data["user_id"],
+            interview_profile=interview_profile,
+            question_plan=question_plan,
+        )
+
+        history = []
+        for i in range(current_index):
+            history.append({
+                "role": "ai",
+                "content": questions[i]["question_text"],
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+            q_id = questions[i]["id"]
+            resp = next((r for r in responses if r["question_id"] == q_id), None)
+            if resp:
+                history.append({
+                    "role": "user",
+                    "content": resp["transcript"],
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+
+        await session_manager.update_session(session_id, {
+            "current_question_index": current_index,
+            "conversation_history": history,
+        })
+
+        return True
+    except Exception as e:
+        print(f"[WS] Error restoring session: {e}")
+        return False
+
 
 @router.websocket("/ws/interview/{session_id}")
 async def interview_websocket(ws: WebSocket, session_id: str):
@@ -141,10 +212,15 @@ async def interview_websocket(ws: WebSocket, session_id: str):
     MAX_LISTEN_RETRIES = 3
 
     session = await session_manager.get_session(session_id)
+
     if not session:
-        await send_json(ws, {"type": "error", "message": "Session not found. Please create a new session."})
-        await ws.close()
-        return
+        restored = await restore_session_from_db(session_id)
+        if restored:
+            session = await session_manager.get_session(session_id)
+        else:
+            await send_json(ws, {"type": "error", "message": "Session not found. Please create a new session."})
+            await ws.close()
+            return
 
     await send_json(ws, build_state_update(session))
 

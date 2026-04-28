@@ -87,6 +87,17 @@ export default function useWebSocket(sessionId) {
     }
   }, [connect])
 
+  // Keepalive: ping every 25s to prevent Render's idle timeout from killing the WS
+  useEffect(() => {
+    if (connectionState !== 'connected') return
+    const interval = setInterval(() => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'ping' }))
+      }
+    }, 25000)
+    return () => clearInterval(interval)
+  }, [connectionState])
+
   const sendMessage = useCallback((data) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(data))

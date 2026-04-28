@@ -97,6 +97,8 @@ async def update_session_status(
     return response.data[0] if response.data else {}
 
 
+
+
 async def get_user_sessions(user_id: str) -> list:
     """Return all sessions for a user with scorecard scores joined."""
     client = get_client()
