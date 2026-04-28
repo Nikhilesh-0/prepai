@@ -13,7 +13,7 @@ A real-time voice-based AI mock interviewer. Paste a job description, speak your
 ## Stack
 
 - **Frontend**: React 18 + Vite + Tailwind CSS → Vercel
-- **Backend**: FastAPI + WebSockets → Koyeb
+- **Backend**: FastAPI + WebSockets → Render
 - **STT**: Groq Whisper large-v3
 - **LLM**: Groq LLaMA 3.3 70B (streaming)
 - **TTS**: Cartesia Sonic
