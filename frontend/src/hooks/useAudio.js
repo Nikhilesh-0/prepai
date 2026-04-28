@@ -2,6 +2,7 @@ import { useRef, useState, useCallback } from 'react'
 
 const SAMPLE_RATE = 44100
 const CHANNELS = 1
+const PLAYBACK_LEAD_TIME = 0.35
 
 export default function useAudio(sendBinaryRef, sendMessageRef) {
   const audioContextRef = useRef(null)
@@ -184,10 +185,10 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
 
       const now = ctx.currentTime
       // If cursor has drifted too far in the past (e.g. after a pause), reset to now
-      if (playbackCursorRef.current < now - 0.1) {
-        playbackCursorRef.current = now + 0.15
+      if (playbackCursorRef.current < now - PLAYBACK_LEAD_TIME) {
+        playbackCursorRef.current = now + PLAYBACK_LEAD_TIME
       }
-      const startAt = Math.max(playbackCursorRef.current, now + 0.15)
+      const startAt = Math.max(playbackCursorRef.current, now + PLAYBACK_LEAD_TIME)
       source.start(startAt)
       playbackCursorRef.current = startAt + audioBuffer.duration
     } catch (err) {
@@ -198,7 +199,7 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
   // Reset cursor to now — call before each AI turn
   const resetPlaybackCursor = useCallback(() => {
     if (audioContextRef.current) {
-      playbackCursorRef.current = audioContextRef.current.currentTime + 0.15
+      playbackCursorRef.current = audioContextRef.current.currentTime + PLAYBACK_LEAD_TIME
     }
   }, [])
 
