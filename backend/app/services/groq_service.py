@@ -45,6 +45,7 @@ async def stream_interviewer_response(
     interview_profile: dict,
     question_plan: list,
     current_index: int,
+    answer_evaluations: list | None = None,
 ) -> AsyncGenerator[str, None]:
     """Stream LLM response for the interviewer turn."""
 
@@ -74,6 +75,19 @@ async def stream_interviewer_response(
                 "say the interview is concluded. Keep it to 1-2 sentences."
             )
         else:
+            latest_eval = (answer_evaluations or [])[-1] if answer_evaluations else None
+            evaluator_note = ""
+            if latest_eval:
+                evaluator_note = (
+                    "\n\nPrivate evaluator signal for the candidate's last answer:\n"
+                    f"- Label: {latest_eval.get('label')} "
+                    f"(confidence {latest_eval.get('confidence')})\n"
+                    f"- Answer score: {latest_eval.get('overall_answer_score')}/100\n"
+                    f"- Should follow up: {latest_eval.get('should_follow_up')}\n"
+                    f"- Reason: {latest_eval.get('reason')}\n"
+                    "Use this signal quietly to decide whether to probe or move on. "
+                    "Do not mention the label, score, evaluator, or rubric to the candidate."
+                )
             turn_instruction = (
                 f"The candidate's last response was: \"{last_user_text[:300]}\"\n\n"
                 f"Do the following in order:\n"
@@ -84,6 +98,7 @@ async def stream_interviewer_response(
                 f"   b) Transition naturally to the next question: \"{next_q}\"\n"
                 f"\nUse the follow-up hint for question {next_q_index}: "
                 f"\"{question_plan[next_q_index].get('follow_up_hint', 'Ask for a specific example')}\""
+                f"{evaluator_note}"
             )
 
     system_prompt = f"""You are Alex, a senior technical interviewer. You are conducting a live mock interview.
@@ -139,6 +154,7 @@ async def generate_scorecard(
     conversation_history: list,
     interview_profile: dict,
     filler_counts: list,
+    answer_evaluations: list | None = None,
 ) -> dict:
     """Generate a scorecard from the completed interview."""
 
@@ -148,6 +164,16 @@ async def generate_scorecard(
         f"{turn['role'].upper()}: {turn['content']}"
         for turn in conversation_history
     ])
+    evaluations_formatted = "No per-answer evaluator data available."
+    if answer_evaluations:
+        evaluations_formatted = "\n".join([
+            (
+                f"Answer {i+1}: label={ev.get('label')}, "
+                f"score={ev.get('overall_answer_score')}, "
+                f"reason={ev.get('reason')}"
+            )
+            for i, ev in enumerate(answer_evaluations)
+        ])
 
     prompt = f"""You are evaluating a mock interview for the role of {interview_profile.get('role_title', 'Software Engineer')} ({interview_profile.get('level', 'mid')} level).
 
@@ -156,6 +182,9 @@ Here is the complete interview transcript:
 {conversation_formatted}
 
 Total filler words detected: {total_fillers}
+
+Small custom evaluator signals:
+{evaluations_formatted}
 
 Evaluate this interview and return ONLY valid JSON (no markdown, no backticks, no explanation) with this exact structure:
 {{

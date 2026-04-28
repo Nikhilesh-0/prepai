@@ -18,6 +18,8 @@ class SessionManager:
                 "conversation_history": [],
                 "current_question_index": 0,
                 "response_scores": [],
+                "answer_evaluations": [],
+                "follow_up_counts": {},
                 "is_ai_speaking": False,
                 "is_listening": False,
                 "total_questions": len(question_plan),

@@ -7,6 +7,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from app.core.session_manager import session_manager
 from app.services.groq_service import transcribe_audio, stream_interviewer_response, generate_scorecard
 from app.services.cartesia_service import stream_tts
+from app.services.answer_evaluator import evaluate_answer
 from app.services.interview_logic import count_filler_words, split_into_tts_chunks
 from app.services import supabase_service
 
@@ -23,6 +24,8 @@ def build_state_update(session: dict) -> dict:
         "is_listening": session["is_listening"],
         "question_plan": session["question_plan"],
         "conversation_history": session["conversation_history"],
+        "answer_evaluations": session.get("answer_evaluations", []),
+        "follow_up_counts": session.get("follow_up_counts", {}),
     }
 
 
@@ -72,6 +75,7 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
             interview_profile=session["interview_profile"],
             question_plan=session["question_plan"],
             current_index=session["current_question_index"],
+            answer_evaluations=session.get("answer_evaluations", []),
         ):
             full_response += text_chunk
             sentence_buffer += text_chunk
@@ -232,6 +236,19 @@ async def interview_websocket(ws: WebSocket, session_id: str):
         if failed_listen_attempts >= MAX_LISTEN_RETRIES:
             # Give up — record a "no response" and advance to next question
             failed_listen_attempts = 0
+            current_session = await session_manager.get_session(session_id)
+            current_idx = current_session["current_question_index"]
+            current_question = ""
+            if current_idx < len(current_session.get("question_plan", [])):
+                current_question = current_session["question_plan"][current_idx].get("question", "")
+            answer_evaluation = evaluate_answer(
+                question=current_question,
+                transcript="(no response)",
+                interview_profile=current_session.get("interview_profile", {}),
+            )
+            answer_evaluations = current_session.get("answer_evaluations", [])
+            answer_evaluations.append(answer_evaluation)
+            await session_manager.update_session(session_id, {"answer_evaluations": answer_evaluations})
             await session_manager.add_conversation_turn(session_id, "user", "(no response)")
 
             current_session = await session_manager.get_session(session_id)
@@ -251,6 +268,7 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                     conversation_history=final_session["conversation_history"],
                     interview_profile=final_session["interview_profile"],
                     filler_counts=final_session.get("filler_word_counts", []),
+                    answer_evaluations=final_session.get("answer_evaluations", []),
                 )
                 scorecard_data["session_id"] = session_id
 
@@ -353,6 +371,33 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                     await send_json(ws, {"type": "transcript", "text": transcript})
 
                     filler_count = count_filler_words(transcript)
+                    current_session = await session_manager.get_session(session_id)
+                    current_idx = current_session["current_question_index"]
+                    current_question = ""
+                    if current_idx < len(current_session.get("question_plan", [])):
+                        current_question = current_session["question_plan"][current_idx].get("question", "")
+
+                    answer_evaluation = evaluate_answer(
+                        question=current_question,
+                        transcript=transcript,
+                        interview_profile=current_session.get("interview_profile", {}),
+                    )
+                    answer_evaluations = current_session.get("answer_evaluations", [])
+                    answer_evaluations.append(answer_evaluation)
+                    follow_up_counts = current_session.get("follow_up_counts", {})
+                    follow_up_key = str(current_idx)
+                    follow_ups_used = int(follow_up_counts.get(follow_up_key, 0))
+                    should_hold_for_follow_up = bool(
+                        answer_evaluation.get("should_follow_up") and follow_ups_used < 1
+                    )
+                    if should_hold_for_follow_up:
+                        follow_up_counts[follow_up_key] = follow_ups_used + 1
+                    await session_manager.update_session(session_id, {
+                        "answer_evaluations": answer_evaluations,
+                        "follow_up_counts": follow_up_counts,
+                    })
+                    await send_json(ws, {"type": "answer_evaluation", "evaluation": answer_evaluation})
+
                     await session_manager.add_conversation_turn(session_id, "user", transcript)
 
                     current_session = await session_manager.get_session(session_id)
@@ -363,7 +408,6 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                     # Persist to Supabase (fire and forget)
                     try:
                         question_ids = await supabase_service.get_question_ids(session_id)
-                        current_idx = current_session["current_question_index"]
                         if question_ids and current_idx < len(question_ids):
                             await supabase_service.save_response({
                                 "session_id": session_id,
@@ -376,9 +420,11 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                     current_session = await session_manager.get_session(session_id)
                     old_index = current_session["current_question_index"]
                     total = current_session["total_questions"]
-                    await session_manager.increment_question_index(session_id)
-
-                    is_last = old_index >= total - 1
+                    if should_hold_for_follow_up:
+                        is_last = False
+                    else:
+                        await session_manager.increment_question_index(session_id)
+                        is_last = old_index >= total - 1
 
                     await handle_ai_turn(ws, session_id)
 
@@ -390,6 +436,7 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                             conversation_history=final_session["conversation_history"],
                             interview_profile=final_session["interview_profile"],
                             filler_counts=final_session.get("filler_word_counts", []),
+                            answer_evaluations=final_session.get("answer_evaluations", []),
                         )
                         scorecard_data["session_id"] = session_id
 
@@ -437,6 +484,7 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                                 conversation_history=final_session["conversation_history"],
                                 interview_profile=final_session["interview_profile"],
                                 filler_counts=final_session.get("filler_word_counts", []),
+                                answer_evaluations=final_session.get("answer_evaluations", []),
                             )
                             scorecard_data["session_id"] = session_id
                             await supabase_service.save_scorecard(scorecard_data)

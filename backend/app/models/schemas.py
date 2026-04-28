@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Any
 from datetime import datetime
 
@@ -103,6 +103,8 @@ class WSStateUpdate(WSMessageBase):
     is_listening: bool
     question_plan: list
     conversation_history: list
+    answer_evaluations: list = Field(default_factory=list)
+    follow_up_counts: dict = Field(default_factory=dict)
 
 
 class WSInterviewComplete(WSMessageBase):
