@@ -136,8 +136,16 @@ body {
 
 /* Processing dots */
 @keyframes dot-pulse {
-  0%, 80%, 100% { opacity: 0.2; }
-  40% { opacity: 1; }
+  0%, 80%, 100% { opacity: 0.2; transform: scale(0.8); }
+  40% { opacity: 1; transform: scale(1.2); }
+}
+
+.thinking-dot {
+  width: 6px;
+  height: 6px;
+  background-color: var(--accent);
+  border-radius: 50%;
+  animation: dot-pulse 1.4s infinite both;
 }
 
 /* Slide in from bottom */

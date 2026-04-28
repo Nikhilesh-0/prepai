@@ -1,59 +1,41 @@
 import React, { useEffect, useState, useRef } from 'react'
 
 export default function LiveTranscript({ text = '', isStreaming = false }) {
-  // While streaming: show the full accumulated text as-is (no typewriter delay on tokens)
-  // After streaming ends (isStreaming=false, text stable): keep showing full text
-  // On reset (text goes to '' then new text): fade out then typewrite new text
   const [displayed, setDisplayed] = useState('')
-  const intervalRef = useRef(null)
-  const prevTextRef = useRef('')
-  const isTypingRef = useRef(false)
+  const textRef = useRef(text)
+  const displayedLenRef = useRef(0)
 
   useEffect(() => {
-    // Text reset — new question starting
-    if (text === '' && prevTextRef.current !== '') {
-      clearInterval(intervalRef.current)
+    textRef.current = text
+    if (text === '') {
       setDisplayed('')
-      prevTextRef.current = ''
-      isTypingRef.current = false
-      return
+      displayedLenRef.current = 0
     }
+  }, [text])
 
-    if (!text) return
-
-    // Same text, no change
-    if (text === prevTextRef.current) return
-
-    prevTextRef.current = text
-
-    // While AI is streaming tokens: just display the full buffer immediately.
-    // This avoids the garbled look from typewriter racing behind fast token arrival.
-    if (isStreaming) {
-      setDisplayed(text)
-      return
-    }
-
-    // Streaming finished — typewrite the complete final text from the start
-    // (only triggered once when isStreaming flips to false)
-    if (!isTypingRef.current) {
-      isTypingRef.current = true
-      setDisplayed('')
-      let i = 0
-      clearInterval(intervalRef.current)
-      intervalRef.current = setInterval(() => {
-        i++
-        setDisplayed(text.slice(0, i))
-        if (i >= text.length) {
-          clearInterval(intervalRef.current)
-          isTypingRef.current = false
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (displayedLenRef.current < textRef.current.length) {
+        // Calculate difference between target and current
+        const diff = textRef.current.length - displayedLenRef.current
+        
+        // Dynamic speed adjustment to catch up if buffer is large
+        // but generally maintain a comfortable reading/speaking pace (~30ms per char)
+        const step = diff > 80 ? 3 : diff > 30 ? 2 : 1
+        
+        displayedLenRef.current += step
+        if (displayedLenRef.current > textRef.current.length) {
+          displayedLenRef.current = textRef.current.length
         }
-      }, 18)
-    }
+        
+        setDisplayed(textRef.current.slice(0, displayedLenRef.current))
+      }
+    }, 30) // Tick every 30ms
+    
+    return () => clearInterval(interval)
+  }, [])
 
-    return () => clearInterval(intervalRef.current)
-  }, [text, isStreaming])
-
-  const showCursor = isStreaming || isTypingRef.current
+  const showCursor = isStreaming || displayed.length < text.length
 
   return (
     <div style={{

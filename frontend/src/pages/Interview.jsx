@@ -109,8 +109,19 @@ export default function Interview() {
         <AIIndicator state={orbState(interviewState)} />
 
         {/* AI text stream */}
-        <div style={{ maxWidth: '600px', width: '100%', textAlign: 'center', minHeight: '80px' }}>
-          <LiveTranscript text={aiTextStream} isStreaming={isAiSpeaking} />
+        <div style={{ maxWidth: '600px', width: '100%', textAlign: 'center', minHeight: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          {interviewState === STATES.PROCESSING ? (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: '10px',
+              color: 'var(--text-muted)', animation: 'slide-up 0.3s ease'
+            }}>
+              <div className="thinking-dot" style={{ animationDelay: '0s' }}></div>
+              <div className="thinking-dot" style={{ animationDelay: '0.2s' }}></div>
+              <div className="thinking-dot" style={{ animationDelay: '0.4s' }}></div>
+            </div>
+          ) : (
+            <LiveTranscript text={aiTextStream} isStreaming={isAiSpeaking} />
+          )}
         </div>
 
         {/* ── IDLE: Begin gate ── */}
