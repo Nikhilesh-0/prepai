@@ -13,6 +13,19 @@ from app.services import supabase_service
 
 router = APIRouter(tags=["websocket"])
 
+PCM_F32LE_SAMPLE_RATE = 44100
+PCM_F32LE_BYTES_PER_SAMPLE = 4
+FIRST_TTS_PREROLL_MS = 350
+TTS_CHUNK_PREROLL_MS = 120
+
+
+def add_pcm_silence_prefix(audio: bytes, duration_ms: int) -> bytes:
+    """Prepend silence to raw mono pcm_f32le audio so browsers do not clip the first phoneme."""
+    if not audio or duration_ms <= 0:
+        return audio
+    sample_count = int(PCM_F32LE_SAMPLE_RATE * duration_ms / 1000)
+    return (b"\x00" * sample_count * PCM_F32LE_BYTES_PER_SAMPLE) + audio
+
 
 def build_state_update(session: dict) -> dict:
     return {
@@ -68,6 +81,7 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
     full_response = ""
     sentence_buffer = ""
     tts_failed = False
+    audio_chunk_count = 0
 
     try:
         async for text_chunk in stream_interviewer_response(
@@ -91,6 +105,9 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
                     if s:
                         audio = await tts_for_sentence(s)
                         if audio:
+                            preroll_ms = FIRST_TTS_PREROLL_MS if audio_chunk_count == 0 else TTS_CHUNK_PREROLL_MS
+                            audio = add_pcm_silence_prefix(audio, preroll_ms)
+                            audio_chunk_count += 1
                             await send_json(ws, {
                                 "type": "audio_response_chunk",
                                 "audio": base64.b64encode(audio).decode("utf-8"),
@@ -103,6 +120,9 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
         if sentence_buffer.strip():
             audio = await tts_for_sentence(sentence_buffer.strip())
             if audio:
+                preroll_ms = FIRST_TTS_PREROLL_MS if audio_chunk_count == 0 else TTS_CHUNK_PREROLL_MS
+                audio = add_pcm_silence_prefix(audio, preroll_ms)
+                audio_chunk_count += 1
                 await send_json(ws, {
                     "type": "audio_response_chunk",
                     "audio": base64.b64encode(audio).decode("utf-8"),

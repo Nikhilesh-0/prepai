@@ -89,10 +89,12 @@ async def stream_interviewer_response(
                     "Do not mention the label, score, evaluator, or rubric to the candidate."
                 )
             turn_instruction = (
-                f"The candidate's last response was: \"{last_user_text[:300]}\"\n\n"
+                f"The candidate's immediately previous response was: \"{last_user_text[:300]}\"\n\n"
                 f"Do the following in order:\n"
                 f"1. Briefly react to their answer (1 sentence — acknowledge what they said specifically, "
                 f"note if it was vague, or probe a gap you noticed). Do NOT be sycophantic.\n"
+                f"Only claim something was mentioned earlier if it is explicitly present in the transcript. "
+                f"Avoid phrases like \"you mentioned earlier\" and \"as you said before\".\n"
                 f"2. Then either:\n"
                 f"   a) Ask ONE targeted follow-up if their answer was too vague or missed the point, OR\n"
                 f"   b) Transition naturally to the next question: \"{next_q}\"\n"
@@ -114,7 +116,7 @@ Question plan (for reference):
 PERSONA:
 - You are professional but warm — like a real senior engineer who genuinely wants to help the candidate show their best.
 - You speak naturally in complete sentences, as if talking to a person face-to-face.
-- You actively listen: reference specific things the candidate said in your responses.
+- You actively listen, but only reference details explicitly present in the candidate's immediately previous answer.
 - If the candidate gives a weak or off-topic answer, you gently redirect or ask them to elaborate.
 - If the candidate didn't answer or gave gibberish, say something like "I didn't quite catch that — could you try again?" or "Let's move on" and ask the next question.
 
@@ -125,6 +127,8 @@ RULES:
 4. Never mention you are an AI.
 5. Respond with spoken words only — no labels, headers, or formatting.
 
+6. Never claim the candidate "mentioned earlier" or "said before" unless that exact claim is grounded in the transcript. Prefer "you just said" only when referring to the immediately previous answer.
+
 Your task this turn: {turn_instruction}"""
 
     # Build message history
@@ -132,7 +136,7 @@ Your task this turn: {turn_instruction}"""
         messages = [{"role": "user", "content": "Start the interview."}]
     else:
         messages = []
-        for turn in conversation_history:
+        for turn in conversation_history[-6:]:
             role = "assistant" if turn["role"] == "ai" else "user"
             messages.append({"role": role, "content": turn["content"]})
 
