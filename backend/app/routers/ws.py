@@ -67,7 +67,8 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
     try:
         cartesia_client = AsyncCartesia(api_key=settings.cartesia_api_key)
         
-        async with cartesia_client.tts.websocket() as ws_cartesia:
+        ws_cartesia = await cartesia_client.tts.websocket()
+        try:
             ctx = ws_cartesia.context(
                 model_id=MODEL_ID,
                 voice=VOICE_SPEC,
@@ -133,12 +134,19 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
             # Run LLM text streaming and Cartesia audio receiving concurrently
             await asyncio.gather(text_sender(), audio_receiver())
 
+        finally:
+            if ws_cartesia:
+                try:
+                    await ws_cartesia.close()
+                except Exception:
+                    pass
+
     except Exception as e:
         # LLM streaming failed — still need to unblock the frontend
-        print(f"[LLM ERROR] {e}")
+        print(f"[LLM/TTS ERROR] {e}")
         traceback.print_exc()
         full_response = full_response or "I encountered an issue. Let's continue — please go ahead."
-        await send_json(ws, {"type": "error", "message": f"LLM error: {str(e)}"})
+        await send_json(ws, {"type": "error", "message": f"LLM/TTS error: {str(e)}"})
 
     # Save whatever response we got
     if full_response:
