@@ -41,20 +41,37 @@ async def send_json(ws: WebSocket, data: dict):
         pass
 
 
-async def tts_for_sentence(sentence: str) -> bytes:
+async def tts_stream_to_frontend(text: str, ws: WebSocket):
     """
-    Run TTS for one sentence. Returns bytes or empty bytes on failure.
-    Never raises — callers must not be interrupted by TTS errors.
+    Stream TTS bytes continuously to the frontend.
+    Aligns bytes to multiples of 4 (PCM float32) to prevent RangeError in JS Float32Array.
     """
     try:
-        audio = b""
-        async for chunk in stream_tts(sentence):
-            audio += chunk
-        return audio
+        buffer = b""
+        async for chunk in stream_tts(text):
+            buffer += chunk
+            if len(buffer) >= 4096:
+                remainder = len(buffer) % 4
+                valid_length = len(buffer) - remainder
+                if valid_length > 0:
+                    await send_json(ws, {
+                        "type": "audio_response_chunk",
+                        "audio": base64.b64encode(buffer[:valid_length]).decode("utf-8"),
+                    })
+                    buffer = buffer[valid_length:]
+        
+        # Flush remaining buffer, padding if strictly necessary
+        if buffer:
+            remainder = len(buffer) % 4
+            if remainder != 0:
+                buffer += b"\x00" * (4 - remainder)
+            await send_json(ws, {
+                "type": "audio_response_chunk",
+                "audio": base64.b64encode(buffer).decode("utf-8"),
+            })
     except Exception as e:
-        print(f"[TTS ERROR] sentence='{sentence[:40]}...' err={e}")
+        print(f"[TTS ERROR] err={e}")
         traceback.print_exc()
-        return b""
 
 
 async def handle_ai_turn(ws: WebSocket, session_id: str):
@@ -84,37 +101,13 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
             answer_evaluations=session.get("answer_evaluations", []),
         ):
             full_response += text_chunk
-            sentence_buffer += text_chunk
-
             # Stream text to frontend immediately for typewriter display
             await send_json(ws, {"type": "ai_text_chunk", "text": text_chunk})
 
-            # Send complete sentences to TTS as they form
-            sentences = split_into_tts_chunks(sentence_buffer)
-            if len(sentences) > 1:
-                for sentence in sentences[:-1]:
-                    s = sentence.strip()
-                    if s:
-                        audio = await tts_for_sentence(s)
-                        if audio:
-                            await send_json(ws, {
-                                "type": "audio_response_chunk",
-                                "audio": base64.b64encode(audio).decode("utf-8"),
-                            })
-                        else:
-                            tts_failed = True
-                sentence_buffer = sentences[-1]
-
-        # Flush last sentence
-        if sentence_buffer.strip():
-            audio = await tts_for_sentence(sentence_buffer.strip())
-            if audio:
-                await send_json(ws, {
-                    "type": "audio_response_chunk",
-                    "audio": base64.b64encode(audio).decode("utf-8"),
-                })
-            else:
-                tts_failed = True
+        # Once LLM is done, stream the ENTIRE response continuously to Cartesia
+        # This completely eliminates sentence-boundary fading and gaps
+        if full_response.strip():
+            await tts_stream_to_frontend(full_response.strip(), ws)
 
     except Exception as e:
         # LLM streaming failed — still need to unblock the frontend
