@@ -91,7 +91,13 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
                         # Stream the chunk to Cartesia in real-time
                         # Ignore empty chunks as they might cause validation errors
                         if text_chunk:
-                            await ctx.send(transcript=text_chunk, continue_=True)
+                            await ctx.send(
+                                model_id=MODEL_ID,
+                                voice=VOICE_SPEC,
+                                output_format=OUTPUT_FORMAT,
+                                transcript=text_chunk,
+                                continue_=True
+                            )
                 except Exception as e:
                     print(f"[LLM STREAM ERROR] {e}")
                 finally:
