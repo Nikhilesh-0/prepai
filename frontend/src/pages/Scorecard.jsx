@@ -254,6 +254,68 @@ export default function Scorecard() {
           </Terminal>
         )}
 
+        {/* Answer Evaluator Breakdown */}
+        {scorecard.answer_evaluations && scorecard.answer_evaluations.length > 0 && (
+          <div style={{ marginBottom: '40px' }}>
+            <h2 style={{
+              fontFamily: 'var(--font)', fontWeight: '700', fontSize: '18px', color: 'var(--text-primary)', marginBottom: '16px'
+            }}>
+              Deterministic Answer Breakdown
+            </h2>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+              {scorecard.answer_evaluations.map((evalData, idx) => {
+                const q = scorecard.question_plan?.[idx]?.question || `Question ${idx + 1}`
+                return (
+                  <div key={idx} style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', padding: '20px' }}>
+                    <div style={{ color: 'var(--text-secondary)', fontSize: '13px', marginBottom: '12px' }}>
+                      <span style={{ color: 'var(--accent)', fontWeight: 'bold' }}>Q{idx + 1}:</span> {q}
+                    </div>
+                    
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '12px', marginBottom: '16px' }}>
+                      <div style={{ background: 'var(--bg)', padding: '12px', border: '1px solid var(--border)' }}>
+                        <div style={{ fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '4px' }}>STAR Structure</div>
+                        <div style={{ fontSize: '13px', color: 'var(--text-primary)' }}>
+                          S/T: {evalData.metrics?.star_components?.situation_task ? '✅' : '❌'} &nbsp;
+                          A: {evalData.metrics?.star_components?.action ? '✅' : '❌'} &nbsp;
+                          R: {evalData.metrics?.star_components?.result ? '✅' : '❌'}
+                        </div>
+                      </div>
+                      
+                      <div style={{ background: 'var(--bg)', padding: '12px', border: '1px solid var(--border)' }}>
+                        <div style={{ fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '4px' }}>Specificity</div>
+                        <div style={{ fontSize: '13px', color: 'var(--text-primary)' }}>
+                          Metrics: {evalData.metrics?.specificity_counts?.metrics || 0}<br/>
+                          Tech Terms: {evalData.metrics?.specificity_counts?.tech_terms || 0}
+                        </div>
+                      </div>
+                      
+                      <div style={{ background: 'var(--bg)', padding: '12px', border: '1px solid var(--border)' }}>
+                        <div style={{ fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '4px' }}>Coherence</div>
+                        <div style={{ fontSize: '13px', color: 'var(--text-primary)' }}>
+                          Transitions: {evalData.metrics?.coherence_categories || 0} types
+                        </div>
+                      </div>
+
+                      <div style={{ background: 'var(--bg)', padding: '12px', border: '1px solid var(--border)' }}>
+                        <div style={{ fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '4px' }}>Overall</div>
+                        <div style={{ fontSize: '13px', color: 'var(--text-primary)', marginTop: '4px' }}>
+                          <Badge variant={evalData.label === 'strong' ? 'success' : evalData.label === 'adequate' ? 'primary' : 'warning'}>{evalData.label}</Badge>
+                        </div>
+                      </div>
+                    </div>
+
+                    {evalData.reason && (
+                      <div style={{ fontSize: '12px', color: 'var(--text-secondary)', borderTop: '1px dashed var(--border)', paddingTop: '12px' }}>
+                        <span style={{ color: 'var(--text-muted)' }}>Evaluator Note:</span> {evalData.reason}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
         {/* Back button */}
         <div style={{ display: 'flex', justifyContent: 'center', paddingBottom: '40px' }}>
           <Button

@@ -180,4 +180,10 @@ def evaluate_answer(
         "overall_answer_score": avg_score,
         "should_follow_up": should_follow_up,
         "reason": final_reason or "The answer requires a follow-up for more depth.",
+        "metrics": {
+            "root_ttr": round(ttr, 3),
+            "coherence_categories": coherence["count"],
+            "star_components": star,
+            "specificity_counts": specificity
+        }
     }

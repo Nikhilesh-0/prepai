@@ -301,6 +301,8 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                     answer_evaluations=final_session.get("answer_evaluations", []),
                 )
                 scorecard_data["session_id"] = session_id
+                scorecard_data["answer_evaluations"] = final_session.get("answer_evaluations", [])
+                scorecard_data["question_plan"] = final_session.get("question_plan", [])
 
                 try:
                     await supabase_service.save_scorecard(scorecard_data)
@@ -469,6 +471,8 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                             answer_evaluations=final_session.get("answer_evaluations", []),
                         )
                         scorecard_data["session_id"] = session_id
+                        scorecard_data["answer_evaluations"] = final_session.get("answer_evaluations", [])
+                        scorecard_data["question_plan"] = final_session.get("question_plan", [])
 
                         try:
                             await supabase_service.save_scorecard(scorecard_data)
@@ -517,6 +521,8 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                                 answer_evaluations=final_session.get("answer_evaluations", []),
                             )
                             scorecard_data["session_id"] = session_id
+                            scorecard_data["answer_evaluations"] = final_session.get("answer_evaluations", [])
+                            scorecard_data["question_plan"] = final_session.get("question_plan", [])
                             await supabase_service.save_scorecard(scorecard_data)
                             await supabase_service.update_session_status(
                                 session_id, "completed", datetime.now(timezone.utc)

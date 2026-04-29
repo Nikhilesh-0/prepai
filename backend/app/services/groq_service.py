@@ -1,8 +1,20 @@
 import os
 import tempfile
+import joblib
+import numpy as np
+from pathlib import Path
 from typing import AsyncGenerator
 from groq import AsyncGroq
 from app.core.config import settings
+
+MODEL_PATH = Path(__file__).resolve().parents[1] / "ml" / "final_grader.joblib"
+final_grader_model = None
+
+def get_final_grader_model():
+    global final_grader_model
+    if final_grader_model is None and MODEL_PATH.exists():
+        final_grader_model = joblib.load(MODEL_PATH)
+    return final_grader_model
 
 client = AsyncGroq(api_key=settings.groq_api_key)
 
@@ -164,6 +176,41 @@ async def generate_scorecard(
 
     total_fillers = sum(filler_counts) if filler_counts else 0
 
+    rf_scores = None
+    if answer_evaluations:
+        try:
+            model = get_final_grader_model()
+            if model:
+                ttrs, techs, metrics_counts, relevances, stars, coherences = [], [], [], [], [], []
+                for ev in answer_evaluations:
+                    m = ev.get("metrics", {})
+                    ttrs.append(m.get("root_ttr", 0))
+                    techs.append(m.get("specificity_counts", {}).get("tech_terms", 0))
+                    metrics_counts.append(m.get("specificity_counts", {}).get("metrics", 0))
+                    relevances.append(ev.get("keyword_overlap", 0))
+                    star_comp = m.get("star_components", {})
+                    stars.append(sum(1 for v in star_comp.values() if v) / 3.0)
+                    coherences.append(m.get("coherence_categories", 0))
+                
+                if ttrs:
+                    X = np.array([[
+                        sum(ttrs) / len(ttrs),
+                        sum(techs),
+                        sum(metrics_counts),
+                        sum(relevances) / len(relevances),
+                        sum(stars) / len(stars),
+                        sum(coherences) / len(coherences)
+                    ]])
+                    pred = model.predict(X)[0]
+                    rf_scores = {
+                        "overall_score": int(pred[0]),
+                        "technical_score": int(pred[1]),
+                        "communication_score": int(pred[2]),
+                        "confidence_score": max(40, min(100, 100 - (total_fillers * 3)))
+                    }
+        except Exception as e:
+            print(f"Error running final grader model: {e}")
+
     conversation_formatted = "\n".join([
         f"{turn['role'].upper()}: {turn['content']}"
         for turn in conversation_history
@@ -226,7 +273,10 @@ Be honest and specific. Base scores on actual response quality. Return ONLY the 
 
     import json
     try:
-        return json.loads(content)
+        parsed = json.loads(content)
+        if rf_scores:
+            parsed.update(rf_scores)
+        return parsed
     except json.JSONDecodeError:
         # Return a default scorecard if parsing fails
         return {
