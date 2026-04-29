@@ -27,9 +27,25 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
   // ── AudioContext ───────────────────────────────────────────────────────────
   const initAudioContext = useCallback(() => {
     if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
+      const ctx = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: SAMPLE_RATE,
       })
+      audioContextRef.current = ctx
+
+      // Audio Keepalive: Play a continuous, completely inaudible tone
+      // This prevents Bluetooth headsets from engaging their noise gates, Auto-Gain Control,
+      // or sleep modes during silent gaps between sentences.
+      const oscillator = ctx.createOscillator()
+      const gainNode = ctx.createGain()
+      
+      oscillator.type = 'sine'
+      oscillator.frequency.value = 100 // 100Hz low frequency
+      gainNode.gain.value = 0.001      // 0.1% volume, basically inaudible
+      
+      oscillator.connect(gainNode)
+      gainNode.connect(ctx.destination)
+      oscillator.start()
+      
     } else if (audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume()
     }
@@ -68,6 +84,8 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
     stream.getTracks().forEach(t => t.stop())
   }, [])
+
+  const sendQueueRef = useRef(Promise.resolve())
 
   // ── stopCurrentRecorder: cleanly tears down existing recorder ─────────────
   // Returns a Promise that resolves once the final ondataavailable has fired
@@ -121,13 +139,21 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     const recorder = new MediaRecorder(stream, { mimeType })
     mediaRecorderRef.current = recorder
 
+    // Reset the sequential queue
+    sendQueueRef.current = Promise.resolve()
+
     recorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0 && !isMutedRef.current) {
-        // Track each async send so we can await them all before sending audio_end
-        const sendPromise = event.data.arrayBuffer().then((buffer) => {
-          sendBinaryRef.current?.(buffer)
-        })
-        pendingSendsRef.current.push(sendPromise)
+        // Track each async send sequentially to prevent WebM chunk corruption
+        const p = sendQueueRef.current
+          .then(() => event.data.arrayBuffer())
+          .then((buffer) => {
+            sendBinaryRef.current?.(buffer)
+          })
+          .catch(console.error)
+        
+        sendQueueRef.current = p
+        pendingSendsRef.current.push(p)
       }
     }
 
