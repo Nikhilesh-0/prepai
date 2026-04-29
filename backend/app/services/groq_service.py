@@ -226,6 +226,15 @@ async def generate_scorecard(
             for i, ev in enumerate(answer_evaluations)
         ])
 
+    rf_scores_text = "Not available"
+    if rf_scores:
+        rf_scores_text = (
+            f"Overall Score: {rf_scores['overall_score']}/100\n"
+            f"Technical Score: {rf_scores['technical_score']}/100\n"
+            f"Communication Score: {rf_scores['communication_score']}/100\n"
+            f"Confidence Score: {rf_scores['confidence_score']}/100"
+        )
+
     prompt = f"""You are evaluating a mock interview for the role of {interview_profile.get('role_title', 'Software Engineer')} ({interview_profile.get('level', 'mid')} level).
 
 Here is the complete interview transcript:
@@ -236,6 +245,9 @@ Total filler words detected: {total_fillers}
 
 Small custom evaluator signals:
 {evaluations_formatted}
+
+Deterministic Model Scores (CRITICAL: YOUR TEXT FEEDBACK MUST EXACTLY MATCH THESE SCORE RANGES. If confidence is 94, say they were highly confident. If technical is 20, say they lacked technical depth.):
+{rf_scores_text}
 
 Evaluate this interview and return ONLY valid JSON (no markdown, no backticks, no explanation) with this exact structure:
 {{

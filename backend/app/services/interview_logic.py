@@ -132,17 +132,24 @@ Make technical questions genuinely challenging and specific to the tech stack. R
         questions = json.loads(content)
         # Validate structure
         validated = []
+        seen_questions = set()
         for q in questions:
             if isinstance(q, dict) and "question" in q:
+                q_text = q["question"].strip()
+                # Deduplicate questions that might be generated twice
+                if q_text.lower() in seen_questions:
+                    continue
+                seen_questions.add(q_text.lower())
+                
                 q_type = q.get("type", "technical")
                 if q_type not in ["hr", "behavioral", "technical"]:
                     q_type = "technical"
                 validated.append({
-                    "question": q["question"],
+                    "question": q_text,
                     "type": q_type,
                     "follow_up_hint": q.get("follow_up_hint", "Ask for a specific example"),
                 })
-        return validated if validated else _default_question_plan(profile)
+        return validated if len(validated) >= 4 else _default_question_plan(profile)
     except json.JSONDecodeError:
         return _default_question_plan(profile)
 

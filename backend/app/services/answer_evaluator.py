@@ -104,6 +104,23 @@ def evaluate_answer(
     clean = (transcript or "").strip()
     word_count = len([t for t in clean.split() if t.strip()])
     
+    # Check for explicit skip intent
+    skip_phrases = {"next question", "skip", "skip this", "move on", "i don't know", "i do not know", "pass"}
+    is_skip = any(phrase in clean.lower() for phrase in skip_phrases) and word_count < 8
+
+    if is_skip:
+        return {
+            "label": "skipped",
+            "confidence": 1.0,
+            "word_count": word_count,
+            "keyword_overlap": 0.0,
+            "scores": {"relevance": 0, "depth": 0, "structure": 0, "specificity": 0},
+            "overall_answer_score": 0,
+            "should_follow_up": False,
+            "reason": "The candidate explicitly skipped the question.",
+            "metrics": {"root_ttr": 0, "coherence_categories": 0, "star_components": {}, "specificity_counts": {}}
+        }
+
     # Base cases for no response or extremely short answer
     if not clean or clean.lower() in {"(no response)", "no response"} or word_count < 6:
         return {
