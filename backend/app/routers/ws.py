@@ -8,7 +8,9 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from app.core.session_manager import session_manager
 from app.services.groq_service import transcribe_audio, stream_interviewer_response, generate_scorecard
-from app.services.cartesia_service import stream_tts
+from app.services.cartesia_service import stream_tts, MODEL_ID, VOICE_SPEC, OUTPUT_FORMAT
+from cartesia import AsyncCartesia
+from app.core.config import settings
 from app.services.answer_evaluator import evaluate_answer
 from app.services.interview_logic import count_filler_words, split_into_tts_chunks
 from app.services import supabase_service
@@ -41,37 +43,7 @@ async def send_json(ws: WebSocket, data: dict):
         pass
 
 
-async def tts_stream_to_frontend(text: str, ws: WebSocket):
-    """
-    Stream TTS bytes continuously to the frontend.
-    Aligns bytes to multiples of 4 (PCM float32) to prevent RangeError in JS Float32Array.
-    """
-    try:
-        buffer = b""
-        async for chunk in stream_tts(text):
-            buffer += chunk
-            if len(buffer) >= 4096:
-                remainder = len(buffer) % 4
-                valid_length = len(buffer) - remainder
-                if valid_length > 0:
-                    await send_json(ws, {
-                        "type": "audio_response_chunk",
-                        "audio": base64.b64encode(buffer[:valid_length]).decode("utf-8"),
-                    })
-                    buffer = buffer[valid_length:]
-        
-        # Flush remaining buffer, padding if strictly necessary
-        if buffer:
-            remainder = len(buffer) % 4
-            if remainder != 0:
-                buffer += b"\x00" * (4 - remainder)
-            await send_json(ws, {
-                "type": "audio_response_chunk",
-                "audio": base64.b64encode(buffer).decode("utf-8"),
-            })
-    except Exception as e:
-        print(f"[TTS ERROR] err={e}")
-        traceback.print_exc()
+# Cartesia TTS Streaming logic is now embedded directly in handle_ai_turn
 
 
 async def handle_ai_turn(ws: WebSocket, session_id: str):
@@ -93,21 +65,73 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
     audio_chunk_count = 0
 
     try:
-        async for text_chunk in stream_interviewer_response(
-            conversation_history=session["conversation_history"],
-            interview_profile=session["interview_profile"],
-            question_plan=session["question_plan"],
-            current_index=session["current_question_index"],
-            answer_evaluations=session.get("answer_evaluations", []),
-        ):
-            full_response += text_chunk
-            # Stream text to frontend immediately for typewriter display
-            await send_json(ws, {"type": "ai_text_chunk", "text": text_chunk})
+        cartesia_client = AsyncCartesia(api_key=settings.cartesia_api_key)
+        
+        async with cartesia_client.tts.websocket() as ws_cartesia:
+            ctx = ws_cartesia.context(
+                model_id=MODEL_ID,
+                voice=VOICE_SPEC,
+                output_format=OUTPUT_FORMAT,
+            )
 
-        # Once LLM is done, stream the ENTIRE response continuously to Cartesia
-        # This completely eliminates sentence-boundary fading and gaps
-        if full_response.strip():
-            await tts_stream_to_frontend(full_response.strip(), ws)
+            async def text_sender():
+                nonlocal full_response
+                try:
+                    async for text_chunk in stream_interviewer_response(
+                        conversation_history=session["conversation_history"],
+                        interview_profile=session["interview_profile"],
+                        question_plan=session["question_plan"],
+                        current_index=session["current_question_index"],
+                        answer_evaluations=session.get("answer_evaluations", []),
+                    ):
+                        full_response += text_chunk
+                        # Stream text to frontend immediately for typewriter display
+                        await send_json(ws, {"type": "ai_text_chunk", "text": text_chunk})
+                        
+                        # Stream the chunk to Cartesia in real-time
+                        # Ignore empty chunks as they might cause validation errors
+                        if text_chunk:
+                            await ctx.send(transcript=text_chunk, continue_=True)
+                except Exception as e:
+                    print(f"[LLM STREAM ERROR] {e}")
+                finally:
+                    # Signal to Cartesia that the text stream is complete
+                    await ctx.no_more_inputs()
+
+            async def audio_receiver():
+                buffer = b""
+                try:
+                    async for response in ctx.receive():
+                        # Handle both object and dict response types based on Cartesia SDK version
+                        resp_type = response.get("type") if isinstance(response, dict) else getattr(response, "type", None)
+                        if resp_type == "chunk":
+                            audio = response.get("audio") if isinstance(response, dict) else getattr(response, "audio", None)
+                            if audio:
+                                buffer += audio
+                                if len(buffer) >= 4096:
+                                    remainder = len(buffer) % 4
+                                    valid_length = len(buffer) - remainder
+                                    if valid_length > 0:
+                                        await send_json(ws, {
+                                            "type": "audio_response_chunk",
+                                            "audio": base64.b64encode(buffer[:valid_length]).decode("utf-8"),
+                                        })
+                                        buffer = buffer[valid_length:]
+                    
+                    # Flush final padded buffer
+                    if buffer:
+                        remainder = len(buffer) % 4
+                        if remainder != 0:
+                            buffer += b"\x00" * (4 - remainder)
+                        await send_json(ws, {
+                            "type": "audio_response_chunk",
+                            "audio": base64.b64encode(buffer).decode("utf-8"),
+                        })
+                except Exception as e:
+                    print(f"[AUDIO RECEIVER ERROR] {e}")
+
+            # Run LLM text streaming and Cartesia audio receiving concurrently
+            await asyncio.gather(text_sender(), audio_receiver())
 
     except Exception as e:
         # LLM streaming failed — still need to unblock the frontend
