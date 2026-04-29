@@ -17,24 +17,6 @@ router = APIRouter(tags=["websocket"])
 
 PCM_F32LE_SAMPLE_RATE = 44100
 PCM_F32LE_BYTES_PER_SAMPLE = 4
-FIRST_TTS_PREROLL_MS = 500
-TTS_CHUNK_PREROLL_MS = 220
-PREROLL_AMPLITUDE = 0.0008
-PREROLL_FREQUENCY_HZ = 80
-
-
-def add_pcm_preroll(audio: bytes, duration_ms: int) -> bytes:
-    """Prepend a very quiet raw pcm_f32le pre-roll so output devices do not gate speech starts."""
-    if not audio or duration_ms <= 0:
-        return audio
-    sample_count = int(PCM_F32LE_SAMPLE_RATE * duration_ms / 1000)
-    preroll = bytearray(sample_count * PCM_F32LE_BYTES_PER_SAMPLE)
-    for i in range(sample_count):
-        sample = PREROLL_AMPLITUDE * math.sin(
-            2 * math.pi * PREROLL_FREQUENCY_HZ * i / PCM_F32LE_SAMPLE_RATE
-        )
-        struct.pack_into("<f", preroll, i * PCM_F32LE_BYTES_PER_SAMPLE, sample)
-    return bytes(preroll) + audio
 
 
 def build_state_update(session: dict) -> dict:
@@ -115,9 +97,6 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
                     if s:
                         audio = await tts_for_sentence(s)
                         if audio:
-                            preroll_ms = FIRST_TTS_PREROLL_MS if audio_chunk_count == 0 else TTS_CHUNK_PREROLL_MS
-                            audio = add_pcm_preroll(audio, preroll_ms)
-                            audio_chunk_count += 1
                             await send_json(ws, {
                                 "type": "audio_response_chunk",
                                 "audio": base64.b64encode(audio).decode("utf-8"),
@@ -130,9 +109,6 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
         if sentence_buffer.strip():
             audio = await tts_for_sentence(sentence_buffer.strip())
             if audio:
-                preroll_ms = FIRST_TTS_PREROLL_MS if audio_chunk_count == 0 else TTS_CHUNK_PREROLL_MS
-                audio = add_pcm_preroll(audio, preroll_ms)
-                audio_chunk_count += 1
                 await send_json(ws, {
                     "type": "audio_response_chunk",
                     "audio": base64.b64encode(audio).decode("utf-8"),
