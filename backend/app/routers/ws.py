@@ -65,111 +65,83 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
     audio_chunk_count = 0
 
     try:
-        cartesia_client = AsyncCartesia(api_key=settings.cartesia_api_key)
-        
-        async with cartesia_client.tts.websocket_connect() as ws_cartesia:
-            ctx = ws_cartesia.context(
-                model_id=MODEL_ID,
-                voice=VOICE_SPEC,
-                output_format=OUTPUT_FORMAT,
-            )
+        sentence_queue = asyncio.Queue()
 
-            async def text_sender():
-                nonlocal full_response
-                from app.services.interview_logic import ABBREVIATIONS
-                try:
-                    text_buffer = ""
-                    async for text_chunk in stream_interviewer_response(
-                        conversation_history=session["conversation_history"],
-                        interview_profile=session["interview_profile"],
-                        question_plan=session["question_plan"],
-                        current_index=session["current_question_index"],
-                        answer_evaluations=session.get("answer_evaluations", []),
-                    ):
-                        full_response += text_chunk
-                        # Stream text to frontend immediately for typewriter display
-                        await send_json(ws, {"type": "ai_text_chunk", "text": text_chunk})
-                        
-                        text_buffer += text_chunk
-                        
-                        last_flush_idx = -1
-                        
-                        # Find the LAST strong punctuation mark followed by space or newline
+        async def text_sender():
+            nonlocal full_response
+            from app.services.interview_logic import ABBREVIATIONS
+            try:
+                text_buffer = ""
+                async for text_chunk in stream_interviewer_response(
+                    conversation_history=session["conversation_history"],
+                    interview_profile=session["interview_profile"],
+                    question_plan=session["question_plan"],
+                    current_index=session["current_question_index"],
+                    answer_evaluations=session.get("answer_evaluations", []),
+                ):
+                    full_response += text_chunk
+                    await send_json(ws, {"type": "ai_text_chunk", "text": text_chunk})
+                    
+                    text_buffer += text_chunk
+                    
+                    last_flush_idx = -1
+                    
+                    for i in range(len(text_buffer) - 2, -1, -1):
+                        if text_buffer[i] in ".?!" and text_buffer[i+1] in " \n":
+                            j = i - 1
+                            word = ""
+                            while j >= 0 and text_buffer[j].isalpha():
+                                word = text_buffer[j] + word
+                                j -= 1
+                            if word.lower() not in ABBREVIATIONS:
+                                last_flush_idx = i + 1
+                                break
+                    
+                    if last_flush_idx == -1 and len(text_buffer) > 150:
                         for i in range(len(text_buffer) - 2, -1, -1):
-                            if text_buffer[i] in ".?!" and text_buffer[i+1] in " \n":
-                                # Check if it's an abbreviation
-                                j = i - 1
-                                word = ""
-                                while j >= 0 and text_buffer[j].isalpha():
-                                    word = text_buffer[j] + word
-                                    j -= 1
-                                if word.lower() not in ABBREVIATIONS:
-                                    last_flush_idx = i + 1  # Include the punctuation and the space
-                                    break
-                        
-                        # If no strong sentence boundary but the buffer is getting too long (e.g. > 150 chars),
-                        # fallback to splitting on commas or semi-colons to prevent latency buildup.
-                        if last_flush_idx == -1 and len(text_buffer) > 150:
-                            for i in range(len(text_buffer) - 2, -1, -1):
-                                if text_buffer[i] in ",;:" and text_buffer[i+1] in " \n":
-                                    last_flush_idx = i + 1
+                            if text_buffer[i] in ",;:" and text_buffer[i+1] in " \n":
+                                last_flush_idx = i + 1
+                                break
+                                
+                        if last_flush_idx == -1 and len(text_buffer) > 200:
+                            for i in range(len(text_buffer) - 1, -1, -1):
+                                if text_buffer[i] in " \n":
+                                    last_flush_idx = i
                                     break
                                     
-                            # Extreme fallback: split on the last space if no punctuation at all and very long
-                            if last_flush_idx == -1 and len(text_buffer) > 200:
-                                for i in range(len(text_buffer) - 1, -1, -1):
-                                    if text_buffer[i] in " \n":
-                                        last_flush_idx = i
-                                        break
-                                        
-                        if last_flush_idx != -1:
-                            to_send = text_buffer[:last_flush_idx+1]
-                            text_buffer = text_buffer[last_flush_idx+1:]
-                            if to_send.strip():
-                                await ctx.send(
-                                    model_id=MODEL_ID,
-                                    voice=VOICE_SPEC,
-                                    output_format=OUTPUT_FORMAT,
-                                    transcript=to_send,
-                                    continue_=True
-                                )
-                                
-                    # Send any remaining text
-                    if text_buffer.strip():
-                        await ctx.send(
-                            model_id=MODEL_ID,
-                            voice=VOICE_SPEC,
-                            output_format=OUTPUT_FORMAT,
-                            transcript=text_buffer + " ",
-                            continue_=True
-                        )
-                except Exception as e:
-                    print(f"[LLM STREAM ERROR] {e}")
-                finally:
-                    # Signal to Cartesia that the text stream is complete
-                    await ctx.no_more_inputs()
+                    if last_flush_idx != -1:
+                        to_send = text_buffer[:last_flush_idx+1]
+                        text_buffer = text_buffer[last_flush_idx+1:]
+                        if to_send.strip():
+                            await sentence_queue.put(to_send.strip())
+                            
+                if text_buffer.strip():
+                    await sentence_queue.put(text_buffer.strip())
+            except Exception as e:
+                print(f"[LLM STREAM ERROR] {e}")
+            finally:
+                await sentence_queue.put(None)
 
-            async def audio_receiver():
-                buffer = b""
-                try:
-                    async for response in ctx.receive():
-                        # Handle both object and dict response types based on Cartesia SDK version
-                        resp_type = response.get("type") if isinstance(response, dict) else getattr(response, "type", None)
-                        if resp_type == "chunk":
-                            audio = response.get("audio") if isinstance(response, dict) else getattr(response, "audio", None)
-                            if audio:
-                                buffer += audio
-                                if len(buffer) >= 16384:
-                                    remainder = len(buffer) % 4
-                                    valid_length = len(buffer) - remainder
-                                    if valid_length > 0:
-                                        await send_json(ws, {
-                                            "type": "audio_response_chunk",
-                                            "audio": base64.b64encode(buffer[:valid_length]).decode("utf-8"),
-                                        })
-                                        buffer = buffer[valid_length:]
-                    
-                    # Flush final padded buffer
+        async def tts_worker():
+            try:
+                while True:
+                    sentence = await sentence_queue.get()
+                    if sentence is None:
+                        break
+                        
+                    buffer = b""
+                    async for chunk in stream_tts(sentence):
+                        buffer += chunk
+                        if len(buffer) >= 8192:
+                            remainder = len(buffer) % 4
+                            valid_length = len(buffer) - remainder
+                            if valid_length > 0:
+                                await send_json(ws, {
+                                    "type": "audio_response_chunk",
+                                    "audio": base64.b64encode(buffer[:valid_length]).decode("utf-8"),
+                                })
+                                buffer = buffer[valid_length:]
+                                
                     if buffer:
                         remainder = len(buffer) % 4
                         if remainder != 0:
@@ -178,11 +150,10 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
                             "type": "audio_response_chunk",
                             "audio": base64.b64encode(buffer).decode("utf-8"),
                         })
-                except Exception as e:
-                    print(f"[AUDIO RECEIVER ERROR] {e}")
+            except Exception as e:
+                print(f"[TTS WORKER ERROR] {e}")
 
-            # Run LLM text streaming and Cartesia audio receiving concurrently
-            await asyncio.gather(text_sender(), audio_receiver())
+        await asyncio.gather(text_sender(), tts_worker())
 
     except Exception as e:
         # LLM streaming failed — still need to unblock the frontend
