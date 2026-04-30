@@ -12,10 +12,10 @@ export const STATES = {
   ERROR: 'error',
 }
 
-// Extra silence to add AFTER the Web Audio scheduler finishes.
-// This covers the Bluetooth hardware output buffer (100–300ms typical)
-// plus a small margin so the user doesn't hear a hard cut-off.
-const BT_HARDWARE_BUFFER_MS = 600
+// Added on top of the Web Audio scheduler finishing.
+// Covers the BT hardware output buffer so the headset finishes
+// playing before getUserMedia() triggers HFP profile switch.
+const BT_HARDWARE_BUFFER_MS = 500
 
 export default function useInterview(sessionId) {
   const [interviewState, setInterviewState] = useState(STATES.IDLE)
@@ -29,7 +29,8 @@ export default function useInterview(sessionId) {
   const aiTextBufferRef = useRef('')
   const startedRef = useRef(false)
   const listeningRef = useRef(false)
-  const pollRef = useRef(null)          // rAF handle for playback polling
+  const pollRef = useRef(null)
+  const speakingDoneAtRef = useRef(null)   // timestamp when speaking_done arrived
 
   const { connectionState, sendMessage, sendBinary, onBinary, onMessage } = useWebSocket(sessionId)
   const sendMessageRef = useRef(sendMessage)
@@ -45,6 +46,7 @@ export default function useInterview(sessionId) {
     playAudioChunk,
     resetPlaybackCursor,
     getRemainingPlaybackMs,
+    isPlaybackTrulyDone,
     isMuted,
     toggleMute,
     isRecording,
@@ -55,14 +57,15 @@ export default function useInterview(sessionId) {
   const resetPlaybackCursorRef = useRef(resetPlaybackCursor)
   const playAudioChunkRef = useRef(playAudioChunk)
   const getRemainingPlaybackMsRef = useRef(getRemainingPlaybackMs)
+  const isPlaybackTrulyDoneRef = useRef(isPlaybackTrulyDone)
   useEffect(() => { startRecordingRef.current = startRecording }, [startRecording])
   useEffect(() => { resetPlaybackCursorRef.current = resetPlaybackCursor }, [resetPlaybackCursor])
   useEffect(() => { playAudioChunkRef.current = playAudioChunk }, [playAudioChunk])
   useEffect(() => { getRemainingPlaybackMsRef.current = getRemainingPlaybackMs }, [getRemainingPlaybackMs])
+  useEffect(() => { isPlaybackTrulyDoneRef.current = isPlaybackTrulyDone }, [isPlaybackTrulyDone])
 
   useEffect(() => { onBinary(() => { }) }, [onBinary])
 
-  // ── cancelPoll: stop any in-flight playback poll ──────────────────────────
   const cancelPoll = useCallback(() => {
     if (pollRef.current) {
       cancelAnimationFrame(pollRef.current)
@@ -70,7 +73,6 @@ export default function useInterview(sessionId) {
     }
   }, [])
 
-  // ── triggerListening ──────────────────────────────────────────────────────
   const triggerListening = useCallback(() => {
     if (listeningRef.current) return
     if (!startedRef.current) return
@@ -88,33 +90,62 @@ export default function useInterview(sessionId) {
       })
   }, [])
 
-  // ── waitForPlaybackThenListen ─────────────────────────────────────────────
+  // ── waitForPlaybackThenListen ──────────────────────────────────────────────
   //
-  // The original code called getRemainingPlaybackMs() once at speaking_done
-  // and used that as a fixed setTimeout delay. This was wrong: speaking_done
-  // arrives from the server as soon as the last TTS chunk is *sent*, but
-  // audio chunks are still arriving and being scheduled on the client. So
-  // remainingMs at that moment is far smaller than the actual playback time.
+  // WHY this exists:
+  //   speaking_done is a tiny JSON message. It arrives from the server before
+  //   many audio_response_chunk messages do, because those chunks are large
+  //   and WebSocket delivery order isn't size-aware. So at speaking_done time,
+  //   getRemainingPlaybackMs() often returns 0 — not because audio is done,
+  //   but because no audio has arrived yet to schedule.
   //
-  // Fix: poll getRemainingPlaybackMs() on every animation frame until it hits
-  // zero (meaning the Web Audio scheduler has finished). Only THEN start the
-  // BT_HARDWARE_BUFFER_MS countdown. This guarantees we never open the mic
-  // while audio is still scheduled, regardless of network jitter or chunk
-  // arrival timing.
+  // TWO-PHASE POLL:
+  //
+  //   Phase 1 — wait for audio to START arriving
+  //     Poll getRemainingPlaybackMs() each frame. While it stays at 0 and
+  //     isPlaybackTrulyDone() is false, audio hasn't arrived yet — keep waiting.
+  //     If getRemainingPlaybackMs() goes > 0, audio is now playing → Phase 2.
+  //     If isPlaybackTrulyDone() becomes true, a chunk arrived and already
+  //     finished (fast network / very short response) → skip to BT wait.
+  //     Fallback: if 5s pass with nothing, open mic anyway (don't hang forever).
+  //
+  //   Phase 2 — wait for audio to FINISH
+  //     Poll until getRemainingPlaybackMs() returns 0 again.
+  //     Then wait BT_HARDWARE_BUFFER_MS for the headset hardware buffer to drain.
+  //     Then open the mic.
+  //
   const waitForPlaybackThenListen = useCallback(() => {
     cancelPoll()
+    speakingDoneAtRef.current = performance.now()
+    const PHASE1_TIMEOUT_MS = 5000
 
     const poll = () => {
       const remaining = getRemainingPlaybackMsRef.current()
+      const elapsed = performance.now() - speakingDoneAtRef.current
 
-      if (remaining > 0) {
-        // Still playing — keep polling
+      // ── Phase 1: waiting for audio to start ──────────────────────────────
+      if (remaining === 0 && !isPlaybackTrulyDoneRef.current()) {
+        // Nothing scheduled yet. Did time out?
+        if (elapsed > PHASE1_TIMEOUT_MS) {
+          // Server may have sent no audio (TTS error). Open mic anyway.
+          pollRef.current = null
+          listeningRef.current = false
+          triggerListening()
+          return
+        }
+        // Keep waiting for first chunk to arrive
         pollRef.current = requestAnimationFrame(poll)
         return
       }
 
-      // Web Audio scheduler is empty. Now wait for the BT hardware buffer
-      // to actually push those last samples to the headphone driver.
+      // ── Phase 2: audio has started (or was instant) ───────────────────────
+      if (remaining > 0) {
+        // Still playing — keep waiting
+        pollRef.current = requestAnimationFrame(poll)
+        return
+      }
+
+      // remaining === 0 AND isPlaybackTrulyDone() === true → scheduler empty
       pollRef.current = null
       setTimeout(() => {
         listeningRef.current = false
@@ -124,6 +155,9 @@ export default function useInterview(sessionId) {
 
     pollRef.current = requestAnimationFrame(poll)
   }, [cancelPoll, triggerListening])
+
+  const waitForPlaybackRef = useRef(waitForPlaybackThenListen)
+  useEffect(() => { waitForPlaybackRef.current = waitForPlaybackThenListen }, [waitForPlaybackThenListen])
 
   // ── WebSocket message handler ─────────────────────────────────────────────
   useEffect(() => {
@@ -148,10 +182,8 @@ export default function useInterview(sessionId) {
         }
 
         case 'speaking_done': {
-          // Cancel any previous poll (e.g. rapid question transitions)
           cancelPoll()
-          // Start polling — don't guess with a fixed delay
-          waitForPlaybackThenListen()
+          waitForPlaybackRef.current()
           break
         }
 
@@ -191,12 +223,9 @@ export default function useInterview(sessionId) {
         default: break
       }
     })
-  }, [onMessage, triggerListening, waitForPlaybackThenListen, cancelPoll])
+  }, [onMessage, cancelPoll])
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => cancelPoll()
-  }, [cancelPoll])
+  useEffect(() => () => cancelPoll(), [cancelPoll])
 
   // ── beginInterview ─────────────────────────────────────────────────────────
   const beginInterview = useCallback(async () => {
@@ -217,14 +246,12 @@ export default function useInterview(sessionId) {
     }
   }, [initAudioContext, requestMicPermission, sendMessage])
 
-  // ── stopListening ──────────────────────────────────────────────────────────
   const stopListening = useCallback(async () => {
     listeningRef.current = false
     setInterviewState(STATES.PROCESSING)
     await stopRecording()
   }, [stopRecording])
 
-  // ── endInterview ───────────────────────────────────────────────────────────
   const endInterview = useCallback(() => {
     sendMessage({ type: 'end_interview' })
     setSessionComplete(true)

@@ -3,33 +3,12 @@ import { useRef, useState, useCallback, useEffect } from 'react'
 const SAMPLE_RATE = 44100
 const CHANNELS = 1
 
-// ── Bluetooth A2DP/HFP fix — the core insight ────────────────────────────────
-//
-// Bluetooth headsets have two incompatible audio profiles:
-//   A2DP  — high-quality stereo, active when NO mic track is open
-//   HFP   — 8kHz mono, heavily compressed, active whenever a mic track is open
-//
-// The original code called requestMicPermission() on session start and kept
-// micStreamRef alive for the entire interview. This locked the headset into
-// HFP permanently — causing the faded/muffled AI voice the user hears.
-//
-// Fix: We do NOT pre-acquire the mic. Instead:
-//   • startRecording()  → getUserMedia() → record → stop tracks immediately after
-//   • stopRecording()   → stops all mic tracks as soon as audio_end is sent
-//
-// This means the mic track is only alive during the ~seconds the user speaks.
-// The headset spends the rest of the time in A2DP, so the AI voice is full quality.
-//
-// requestMicPermission() still exists but now ONLY asks for the browser permission
-// prompt (needed on first interaction). It acquires and immediately releases the
-// track so the permission is cached without keeping HFP active.
-// ─────────────────────────────────────────────────────────────────────────────
-
 export default function useAudio(sendBinaryRef, sendMessageRef) {
   const audioContextRef = useRef(null)
   const mediaRecorderRef = useRef(null)
-  const micStreamRef = useRef(null)      // only non-null during active recording
+  const micStreamRef = useRef(null)
   const playbackCursorRef = useRef(0)
+  const hasReceivedAudioRef = useRef(false)  // true once first chunk of current turn is scheduled
   const animFrameRef = useRef(null)
   const isRecordingRef = useRef(false)
   const pendingSendsRef = useRef([])
@@ -45,14 +24,13 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     setIsMuted(next)
   }, [])
 
-  // Defensive cleanup on unmount only
   useEffect(() => {
-    return () => {
-      releaseMicTracks()
-    }
+    return () => releaseMicTracks()
   }, [])
 
-  // Stops and nulls the mic stream — keeps HFP from staying active
+  // ── releaseMicTracks ───────────────────────────────────────────────────────
+  // Stops all mic tracks so the BT headset can switch back from HFP → A2DP.
+  // Called immediately after stopRecording() sends audio_end.
   const releaseMicTracks = useCallback(() => {
     if (micStreamRef.current) {
       micStreamRef.current.getTracks().forEach(t => t.stop())
@@ -60,11 +38,8 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     }
   }, [])
 
-  // ── AudioContext — created once, kept alive forever ────────────────────────
-  //
-  // Never close or recreate this. Recreating it resets the audio clock and
-  // causes its own glitches. The keepalive oscillator prevents Bluetooth noise
-  // gates from cutting in during silent gaps between AI sentences.
+  // ── AudioContext — created once, never closed ──────────────────────────────
+  // Keepalive oscillator prevents BT noise gate from engaging during silence.
   const initAudioContext = useCallback(() => {
     if (!audioContextRef.current) {
       const ctx = new (window.AudioContext || window.webkitAudioContext)({
@@ -73,7 +48,6 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
       })
       audioContextRef.current = ctx
 
-      // Keepalive: inaudible 100Hz tone, prevents BT noise gate / sleep
       const osc = ctx.createOscillator()
       const gain = ctx.createGain()
       osc.type = 'sine'
@@ -82,11 +56,9 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
       osc.connect(gain)
       gain.connect(ctx.destination)
       osc.start()
-
     } else if (audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume()
     }
-
     playbackCursorRef.current = audioContextRef.current.currentTime
     return audioContextRef.current
   }, [])
@@ -117,14 +89,11 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
   }, [])
 
   // ── requestMicPermission ───────────────────────────────────────────────────
-  //
-  // Only triggers the browser permission prompt. Acquires then immediately
-  // releases the mic so the user sees the prompt once, without locking HFP.
-  // Call this once when the user clicks "Begin Interview".
+  // Triggers the browser permission prompt, then immediately releases the
+  // stream. This caches the grant without locking the BT headset into HFP.
   const requestMicPermission = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
-      // Release immediately — we only wanted the permission grant cached
       stream.getTracks().forEach(t => t.stop())
     } catch (e) {
       console.warn('Mic permission denied:', e)
@@ -137,43 +106,38 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
   const stopCurrentRecorder = useCallback(() => {
     return new Promise((resolve) => {
       const recorder = mediaRecorderRef.current
-      if (!recorder || recorder.state === 'inactive') {
-        resolve()
-        return
-      }
+      if (!recorder || recorder.state === 'inactive') { resolve(); return }
       recorder.onstop = () => resolve()
       recorder.stop()
       mediaRecorderRef.current = null
     })
   }, [])
 
+  // ── markNewAiTurn ──────────────────────────────────────────────────────────
+  // Called by useInterview when a new AI turn begins (first audio_response_chunk).
+  // Resets the flag so the poll in useInterview knows audio has started arriving.
+  const markNewAiTurn = useCallback(() => {
+    hasReceivedAudioRef.current = false
+  }, [])
+
   // ── startRecording ─────────────────────────────────────────────────────────
-  //
-  // Acquires the mic fresh each turn. This is intentional — we released it
-  // after the previous turn so the headset could switch back to A2DP.
+  // Acquires mic fresh each turn so BT can be in A2DP during AI speech.
   const startRecording = useCallback(async () => {
     const ctx = audioContextRef.current
     if (!ctx) throw new Error('AudioContext not initialized')
     if (ctx.state === 'suspended') await ctx.resume()
 
     await stopCurrentRecorder()
-    releaseMicTracks() // ensure previous turn's tracks are gone
+    releaseMicTracks()
 
-    // Fresh getUserMedia every turn — this is what allows the headset to
-    // switch back to A2DP between turns and return here at full quality
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       video: false,
     })
     micStreamRef.current = stream
 
-    // Level meter: MediaStreamSource → analyser only, NOT to destination.
-    // Connecting to destination would give the browser a reason to keep
-    // the mic's HFP audio path alive through the Web Audio graph.
+    // Analyser only — not connected to destination, so BT stays in HFP
+    // only for the duration of actual recording, not during playback.
     const source = ctx.createMediaStreamSource(stream)
     const analyser = ctx.createAnalyser()
     analyser.fftSize = 256
@@ -182,24 +146,18 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
 
     const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
       ? 'audio/webm;codecs=opus'
-      : MediaRecorder.isTypeSupported('audio/webm')
-        ? 'audio/webm'
-        : 'audio/ogg;codecs=opus'
+      : MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/ogg;codecs=opus'
 
     const recorder = new MediaRecorder(stream, { mimeType })
     mediaRecorderRef.current = recorder
-
     sendQueueRef.current = Promise.resolve()
 
     recorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0 && !isMutedRef.current) {
         const p = sendQueueRef.current
           .then(() => event.data.arrayBuffer())
-          .then((buffer) => {
-            sendBinaryRef.current?.(buffer)
-          })
+          .then((buffer) => { sendBinaryRef.current?.(buffer) })
           .catch(console.error)
-
         sendQueueRef.current = p
         pendingSendsRef.current.push(p)
       }
@@ -214,22 +172,17 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
   const stopRecording = useCallback(async () => {
     isRecordingRef.current = false
     stopLevelMeter()
-
     await stopCurrentRecorder()
 
-    // Wait for all in-flight arrayBuffer→sendBinary promises before audio_end.
-    // onstop fires before the last ondataavailable .then() resolves — without
-    // this, audio_end races ahead of the final binary chunk.
+    // Wait for all in-flight sends — onstop fires before the last
+    // ondataavailable .then() resolves, so audio_end must come after.
     await Promise.all(pendingSendsRef.current)
     pendingSendsRef.current = []
 
     setIsRecording(false)
-
-    // Send audio_end first, THEN release mic tracks.
-    // Releasing before sending could abort the last send on some browsers.
     sendMessageRef.current?.({ type: 'audio_end' })
 
-    // NOW release — headset can switch back to A2DP for AI playback
+    // Release mic NOW — headset switches back to A2DP for AI playback
     releaseMicTracks()
   }, [stopCurrentRecorder, stopLevelMeter, releaseMicTracks, sendMessageRef])
 
@@ -247,7 +200,6 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
       // PCM f32le must be 4-byte aligned
       const alignedLength = bytes.length - (bytes.length % 4)
       if (alignedLength === 0) return
-
       const float32 = new Float32Array(bytes.buffer, 0, alignedLength / 4)
       if (float32.length === 0) return
 
@@ -259,17 +211,16 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
       source.connect(ctx.destination)
 
       const now = ctx.currentTime
-
-      // Reset cursor only if significantly stale (gap between questions).
-      // Within a continuous stream, chain chunks precisely — no added lead
-      // time per chunk, which was causing cumulative drift in the original.
+      // Only reset cursor if stale — don't add lead time per-chunk (causes drift)
       if (playbackCursorRef.current < now - 0.5) {
         playbackCursorRef.current = now + 0.08
       }
-
       const startAt = Math.max(playbackCursorRef.current, now)
       source.start(startAt)
       playbackCursorRef.current = startAt + audioBuffer.duration
+
+      // Mark that audio has started arriving for this turn
+      hasReceivedAudioRef.current = true
     } catch (err) {
       console.error('Audio playback error:', err)
     }
@@ -278,15 +229,20 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
   const resetPlaybackCursor = useCallback(() => {
     if (audioContextRef.current) {
       playbackCursorRef.current = audioContextRef.current.currentTime + 0.08
+      hasReceivedAudioRef.current = false
     }
   }, [])
 
   const getRemainingPlaybackMs = useCallback(() => {
     const ctx = audioContextRef.current
     if (!ctx) return 0
-    const remaining = playbackCursorRef.current - ctx.currentTime
-    return Math.max(0, remaining * 1000)
+    return Math.max(0, (playbackCursorRef.current - ctx.currentTime) * 1000)
   }, [])
+
+  // True only once the first chunk has been scheduled AND the scheduler is empty
+  const isPlaybackTrulyDone = useCallback(() => {
+    return hasReceivedAudioRef.current && getRemainingPlaybackMs() === 0
+  }, [getRemainingPlaybackMs])
 
   const toggleMute = useCallback(() => setIsMutedWrapped(p => !p), [setIsMutedWrapped])
 
@@ -298,6 +254,8 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     playAudioChunk,
     resetPlaybackCursor,
     getRemainingPlaybackMs,
+    isPlaybackTrulyDone,   // ← new, used by useInterview poll
+    markNewAiTurn,         // ← new, called on first audio_response_chunk
     isMuted,
     toggleMute,
     isRecording,
