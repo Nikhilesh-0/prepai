@@ -76,7 +76,9 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
 
             async def text_sender():
                 nonlocal full_response
+                from app.services.interview_logic import ABBREVIATIONS
                 try:
+                    text_buffer = ""
                     async for text_chunk in stream_interviewer_response(
                         conversation_history=session["conversation_history"],
                         interview_profile=session["interview_profile"],
@@ -88,16 +90,59 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
                         # Stream text to frontend immediately for typewriter display
                         await send_json(ws, {"type": "ai_text_chunk", "text": text_chunk})
                         
-                        # Stream the chunk to Cartesia in real-time
-                        # Ignore empty chunks as they might cause validation errors
-                        if text_chunk:
-                            await ctx.send(
-                                model_id=MODEL_ID,
-                                voice=VOICE_SPEC,
-                                output_format=OUTPUT_FORMAT,
-                                transcript=text_chunk,
-                                continue_=True
-                            )
+                        text_buffer += text_chunk
+                        
+                        last_flush_idx = -1
+                        
+                        # Find the LAST strong punctuation mark followed by space or newline
+                        for i in range(len(text_buffer) - 2, -1, -1):
+                            if text_buffer[i] in ".?!" and text_buffer[i+1] in " \n":
+                                # Check if it's an abbreviation
+                                j = i - 1
+                                word = ""
+                                while j >= 0 and text_buffer[j].isalpha():
+                                    word = text_buffer[j] + word
+                                    j -= 1
+                                if word.lower() not in ABBREVIATIONS:
+                                    last_flush_idx = i + 1  # Include the punctuation and the space
+                                    break
+                        
+                        # If no strong sentence boundary but the buffer is getting too long (e.g. > 150 chars),
+                        # fallback to splitting on commas or semi-colons to prevent latency buildup.
+                        if last_flush_idx == -1 and len(text_buffer) > 150:
+                            for i in range(len(text_buffer) - 2, -1, -1):
+                                if text_buffer[i] in ",;:" and text_buffer[i+1] in " \n":
+                                    last_flush_idx = i + 1
+                                    break
+                                    
+                            # Extreme fallback: split on the last space if no punctuation at all and very long
+                            if last_flush_idx == -1 and len(text_buffer) > 200:
+                                for i in range(len(text_buffer) - 1, -1, -1):
+                                    if text_buffer[i] in " \n":
+                                        last_flush_idx = i
+                                        break
+                                        
+                        if last_flush_idx != -1:
+                            to_send = text_buffer[:last_flush_idx+1]
+                            text_buffer = text_buffer[last_flush_idx+1:]
+                            if to_send.strip():
+                                await ctx.send(
+                                    model_id=MODEL_ID,
+                                    voice=VOICE_SPEC,
+                                    output_format=OUTPUT_FORMAT,
+                                    transcript=to_send,
+                                    continue_=True
+                                )
+                                
+                    # Send any remaining text
+                    if text_buffer:
+                        await ctx.send(
+                            model_id=MODEL_ID,
+                            voice=VOICE_SPEC,
+                            output_format=OUTPUT_FORMAT,
+                            transcript=text_buffer,
+                            continue_=True
+                        )
                 except Exception as e:
                     print(f"[LLM STREAM ERROR] {e}")
                 finally:
