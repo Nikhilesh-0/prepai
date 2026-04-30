@@ -12,6 +12,11 @@ export const STATES = {
   ERROR: 'error',
 }
 
+// Extra silence to add AFTER the Web Audio scheduler finishes.
+// This covers the Bluetooth hardware output buffer (100–300ms typical)
+// plus a small margin so the user doesn't hear a hard cut-off.
+const BT_HARDWARE_BUFFER_MS = 600
+
 export default function useInterview(sessionId) {
   const [interviewState, setInterviewState] = useState(STATES.IDLE)
   const [questionIndex, setQuestionIndex] = useState(0)
@@ -24,7 +29,7 @@ export default function useInterview(sessionId) {
   const aiTextBufferRef = useRef('')
   const startedRef = useRef(false)
   const listeningRef = useRef(false)
-  const speakingDoneTimerRef = useRef(null)
+  const pollRef = useRef(null)          // rAF handle for playback polling
 
   const { connectionState, sendMessage, sendBinary, onBinary, onMessage } = useWebSocket(sessionId)
   const sendMessageRef = useRef(sendMessage)
@@ -46,7 +51,6 @@ export default function useInterview(sessionId) {
     audioLevel,
   } = useAudio(sendBinaryRef, sendMessageRef)
 
-  // Keep refs so callbacks inside the message handler never close over stale values
   const startRecordingRef = useRef(startRecording)
   const resetPlaybackCursorRef = useRef(resetPlaybackCursor)
   const playAudioChunkRef = useRef(playAudioChunk)
@@ -58,7 +62,15 @@ export default function useInterview(sessionId) {
 
   useEffect(() => { onBinary(() => { }) }, [onBinary])
 
-  // ── triggerListening: called from setTimeout, uses refs not closures ───────
+  // ── cancelPoll: stop any in-flight playback poll ──────────────────────────
+  const cancelPoll = useCallback(() => {
+    if (pollRef.current) {
+      cancelAnimationFrame(pollRef.current)
+      pollRef.current = null
+    }
+  }, [])
+
+  // ── triggerListening ──────────────────────────────────────────────────────
   const triggerListening = useCallback(() => {
     if (listeningRef.current) return
     if (!startedRef.current) return
@@ -74,9 +86,46 @@ export default function useInterview(sessionId) {
         setErrorMessage('Microphone error: ' + (err.message || 'unknown'))
         setInterviewState(STATES.ERROR)
       })
-  }, []) // no dependencies — reads everything via refs
+  }, [])
 
-  // ── WebSocket message handler (direct callback — no React batching) ────────
+  // ── waitForPlaybackThenListen ─────────────────────────────────────────────
+  //
+  // The original code called getRemainingPlaybackMs() once at speaking_done
+  // and used that as a fixed setTimeout delay. This was wrong: speaking_done
+  // arrives from the server as soon as the last TTS chunk is *sent*, but
+  // audio chunks are still arriving and being scheduled on the client. So
+  // remainingMs at that moment is far smaller than the actual playback time.
+  //
+  // Fix: poll getRemainingPlaybackMs() on every animation frame until it hits
+  // zero (meaning the Web Audio scheduler has finished). Only THEN start the
+  // BT_HARDWARE_BUFFER_MS countdown. This guarantees we never open the mic
+  // while audio is still scheduled, regardless of network jitter or chunk
+  // arrival timing.
+  const waitForPlaybackThenListen = useCallback(() => {
+    cancelPoll()
+
+    const poll = () => {
+      const remaining = getRemainingPlaybackMsRef.current()
+
+      if (remaining > 0) {
+        // Still playing — keep polling
+        pollRef.current = requestAnimationFrame(poll)
+        return
+      }
+
+      // Web Audio scheduler is empty. Now wait for the BT hardware buffer
+      // to actually push those last samples to the headphone driver.
+      pollRef.current = null
+      setTimeout(() => {
+        listeningRef.current = false
+        triggerListening()
+      }, BT_HARDWARE_BUFFER_MS)
+    }
+
+    pollRef.current = requestAnimationFrame(poll)
+  }, [cancelPoll, triggerListening])
+
+  // ── WebSocket message handler ─────────────────────────────────────────────
   useEffect(() => {
     onMessage((msg) => {
       switch (msg.type) {
@@ -99,23 +148,16 @@ export default function useInterview(sessionId) {
         }
 
         case 'speaking_done': {
-          // Clear any pending timer
-          if (speakingDoneTimerRef.current) clearTimeout(speakingDoneTimerRef.current)
-
-          // Calculate actual remaining playback time instead of guessing
-          const remainingMs = getRemainingPlaybackMsRef.current()
-          // Add 800ms buffer after audio finishes, minimum 1200ms total
-          const delay = Math.max(remainingMs + 800, 1200)
-
-          speakingDoneTimerRef.current = setTimeout(() => {
-            listeningRef.current = false
-            triggerListening()
-          }, delay)
+          // Cancel any previous poll (e.g. rapid question transitions)
+          cancelPoll()
+          // Start polling — don't guess with a fixed delay
+          waitForPlaybackThenListen()
           break
         }
 
         case 'transcript': {
           listeningRef.current = false
+          cancelPoll()
           setTranscript(msg.text)
           setInterviewState(STATES.PROCESSING)
           setAiTextStream('')
@@ -136,11 +178,9 @@ export default function useInterview(sessionId) {
 
         case 'error': {
           console.warn('WS error:', msg.message)
-          // If the session was lost (server restart), mark it so the UI can redirect
           if (msg.message && msg.message.toLowerCase().includes('session not found')) {
             setErrorMessage('Session expired. Please start a new interview.')
             setInterviewState(STATES.ERROR)
-            // Removed setSessionComplete(true) to prevent silent redirect to dashboard
           } else {
             setErrorMessage(msg.message)
             setTimeout(() => setErrorMessage(''), 4000)
@@ -151,14 +191,12 @@ export default function useInterview(sessionId) {
         default: break
       }
     })
-  }, [onMessage, triggerListening])
+  }, [onMessage, triggerListening, waitForPlaybackThenListen, cancelPoll])
 
-  // Cleanup timer on unmount
+  // Cleanup on unmount
   useEffect(() => {
-    return () => {
-      if (speakingDoneTimerRef.current) clearTimeout(speakingDoneTimerRef.current)
-    }
-  }, [])
+    return () => cancelPoll()
+  }, [cancelPoll])
 
   // ── beginInterview ─────────────────────────────────────────────────────────
   const beginInterview = useCallback(async () => {
@@ -179,14 +217,14 @@ export default function useInterview(sessionId) {
     }
   }, [initAudioContext, requestMicPermission, sendMessage])
 
-  // ── stopListening ─────────────────────────────────────────────────────────
+  // ── stopListening ──────────────────────────────────────────────────────────
   const stopListening = useCallback(async () => {
     listeningRef.current = false
     setInterviewState(STATES.PROCESSING)
     await stopRecording()
   }, [stopRecording])
 
-  // ── endInterview ──────────────────────────────────────────────────────────
+  // ── endInterview ───────────────────────────────────────────────────────────
   const endInterview = useCallback(() => {
     sendMessage({ type: 'end_interview' })
     setSessionComplete(true)
