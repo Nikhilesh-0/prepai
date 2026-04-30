@@ -1,30 +1,34 @@
 import { useRef, useState, useCallback, useEffect } from 'react'
 
-// Cartesia streams PCM f32le at 44100Hz mono
 const SAMPLE_RATE = 44100
 const CHANNELS = 1
 
-// ── Bluetooth A2DP/HFP Fix ────────────────────────────────────────────────────
-// Bluetooth headsets use A2DP (high-quality stereo) for output-only, but
-// automatically switch to HFP/HSP (8kHz mono, heavily compressed) the moment
-// the microphone is activated. This profile switch tears down and rebuilds the
-// browser's audio pipeline mid-playback, causing word skips and glitches.
+// ── Bluetooth A2DP/HFP fix — the core insight ────────────────────────────────
 //
-// Fix: Keep ONE AudioContext alive for the entire session and NEVER close/reopen
-// it. Use separate GainNodes to independently control playback volume vs mic
-// routing. The mic stream uses a MediaStreamSource routed only to the analyser
-// (never to destination), so it doesn't trigger the HFP profile switch.
+// Bluetooth headsets have two incompatible audio profiles:
+//   A2DP  — high-quality stereo, active when NO mic track is open
+//   HFP   — 8kHz mono, heavily compressed, active whenever a mic track is open
 //
-// Additionally, the keepalive oscillator (0.001 gain, 100Hz) prevents Bluetooth
-// devices from engaging their noise gate / sleep mode during silent gaps.
+// The original code called requestMicPermission() on session start and kept
+// micStreamRef alive for the entire interview. This locked the headset into
+// HFP permanently — causing the faded/muffled AI voice the user hears.
+//
+// Fix: We do NOT pre-acquire the mic. Instead:
+//   • startRecording()  → getUserMedia() → record → stop tracks immediately after
+//   • stopRecording()   → stops all mic tracks as soon as audio_end is sent
+//
+// This means the mic track is only alive during the ~seconds the user speaks.
+// The headset spends the rest of the time in A2DP, so the AI voice is full quality.
+//
+// requestMicPermission() still exists but now ONLY asks for the browser permission
+// prompt (needed on first interaction). It acquires and immediately releases the
+// track so the permission is cached without keeping HFP active.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function useAudio(sendBinaryRef, sendMessageRef) {
   const audioContextRef = useRef(null)
-  const keepaliveRef = useRef(null)          // {oscillator, gain} — started once, never stopped
-  const playbackGainRef = useRef(null)       // GainNode for TTS output
   const mediaRecorderRef = useRef(null)
-  const micStreamRef = useRef(null)
+  const micStreamRef = useRef(null)      // only non-null during active recording
   const playbackCursorRef = useRef(0)
   const animFrameRef = useRef(null)
   const isRecordingRef = useRef(false)
@@ -41,51 +45,48 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     setIsMuted(next)
   }, [])
 
+  // Defensive cleanup on unmount only
   useEffect(() => {
     return () => {
-      if (micStreamRef.current) {
-        micStreamRef.current.getTracks().forEach(t => t.stop())
-      }
-      // Don't close audioContextRef here — it outlives individual renders
+      releaseMicTracks()
     }
   }, [])
 
-  // ── AudioContext — created ONCE, reused for the entire session ────────────
+  // Stops and nulls the mic stream — keeps HFP from staying active
+  const releaseMicTracks = useCallback(() => {
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach(t => t.stop())
+      micStreamRef.current = null
+    }
+  }, [])
+
+  // ── AudioContext — created once, kept alive forever ────────────────────────
   //
-  // KEY: We never call ctx.close() or create a new AudioContext after this
-  // point. Recreating it is what triggers the Bluetooth profile renegotiation.
+  // Never close or recreate this. Recreating it resets the audio clock and
+  // causes its own glitches. The keepalive oscillator prevents Bluetooth noise
+  // gates from cutting in during silent gaps between AI sentences.
   const initAudioContext = useCallback(() => {
     if (!audioContextRef.current) {
       const ctx = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: SAMPLE_RATE,
-        // latencyHint: 'playback' gives the browser permission to buffer more
-        // aggressively, reducing glitches on high-latency Bluetooth links.
         latencyHint: 'playback',
       })
       audioContextRef.current = ctx
 
-      // Playback gain node — all TTS audio routes through this
-      const playbackGain = ctx.createGain()
-      playbackGain.gain.value = 1.0
-      playbackGain.connect(ctx.destination)
-      playbackGainRef.current = playbackGain
-
-      // Keepalive: inaudible 100Hz tone to prevent Bluetooth noise gate
-      const oscillator = ctx.createOscillator()
-      const keepGain = ctx.createGain()
-      oscillator.type = 'sine'
-      oscillator.frequency.value = 100
-      keepGain.gain.value = 0.001
-      oscillator.connect(keepGain)
-      keepGain.connect(ctx.destination)
-      oscillator.start()
-      keepaliveRef.current = { oscillator, gain: keepGain }
+      // Keepalive: inaudible 100Hz tone, prevents BT noise gate / sleep
+      const osc = ctx.createOscillator()
+      const gain = ctx.createGain()
+      osc.type = 'sine'
+      osc.frequency.value = 100
+      gain.gain.value = 0.001
+      osc.connect(gain)
+      gain.connect(ctx.destination)
+      osc.start()
 
     } else if (audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume()
     }
 
-    // Reset playback cursor to "now" so first chunk plays immediately
     playbackCursorRef.current = audioContextRef.current.currentTime
     return audioContextRef.current
   }, [])
@@ -115,26 +116,19 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     setAudioLevel(0)
   }, [])
 
-  // ── Mic permission pre-grant ───────────────────────────────────────────────
+  // ── requestMicPermission ───────────────────────────────────────────────────
   //
-  // IMPORTANT: We request mic permission here so it's obtained BEFORE
-  // initAudioContext() is called. On some browsers, getUserMedia() after an
-  // AudioContext is created can trigger a context state change that pauses
-  // playback. Pre-granting avoids this entirely.
+  // Only triggers the browser permission prompt. Acquires then immediately
+  // releases the mic so the user sees the prompt once, without locking HFP.
+  // Call this once when the user clicks "Begin Interview".
   const requestMicPermission = useCallback(async () => {
-    if (!micStreamRef.current) {
-      micStreamRef.current = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          // These constraints are critical for Bluetooth:
-          // Disable processing that would trigger profile switching
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          // Do NOT set sampleRate here — let the browser/BT device negotiate.
-          // Forcing 44100 can cause HFP to fail entirely on some headsets.
-        },
-        video: false,
-      })
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+      // Release immediately — we only wanted the permission grant cached
+      stream.getTracks().forEach(t => t.stop())
+    } catch (e) {
+      console.warn('Mic permission denied:', e)
+      throw e
     }
   }, [])
 
@@ -154,35 +148,36 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
   }, [])
 
   // ── startRecording ─────────────────────────────────────────────────────────
+  //
+  // Acquires the mic fresh each turn. This is intentional — we released it
+  // after the previous turn so the headset could switch back to A2DP.
   const startRecording = useCallback(async () => {
     const ctx = audioContextRef.current
     if (!ctx) throw new Error('AudioContext not initialized')
     if (ctx.state === 'suspended') await ctx.resume()
 
     await stopCurrentRecorder()
+    releaseMicTracks() // ensure previous turn's tracks are gone
 
-    let stream = micStreamRef.current
-    if (!stream || stream.getTracks().some(t => t.readyState === 'ended')) {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-        video: false,
-      })
-      micStreamRef.current = stream
-    }
+    // Fresh getUserMedia every turn — this is what allows the headset to
+    // switch back to A2DP between turns and return here at full quality
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+      video: false,
+    })
+    micStreamRef.current = stream
 
-    // Route mic → analyser ONLY (not to ctx.destination).
-    // This is the key Bluetooth fix on the mic side: the MediaStreamSource
-    // goes to the analyser for the level meter, but is NOT connected to
-    // destination, so the browser has no reason to switch audio profiles.
+    // Level meter: MediaStreamSource → analyser only, NOT to destination.
+    // Connecting to destination would give the browser a reason to keep
+    // the mic's HFP audio path alive through the Web Audio graph.
     const source = ctx.createMediaStreamSource(stream)
     const analyser = ctx.createAnalyser()
     analyser.fftSize = 256
     source.connect(analyser)
-    // Intentionally NOT connecting: source.connect(ctx.destination)
     startLevelMeter(analyser)
 
     const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
@@ -213,7 +208,7 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     recorder.start(250)
     isRecordingRef.current = true
     setIsRecording(true)
-  }, [stopCurrentRecorder, startLevelMeter, sendBinaryRef])
+  }, [stopCurrentRecorder, releaseMicTracks, startLevelMeter, sendBinaryRef])
 
   // ── stopRecording ──────────────────────────────────────────────────────────
   const stopRecording = useCallback(async () => {
@@ -222,24 +217,23 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
 
     await stopCurrentRecorder()
 
-    // Wait for all in-flight arrayBuffer→sendBinary promises.
-    // onstop fires before the last ondataavailable .then() resolves,
-    // so without this, audio_end would race ahead of the last binary chunk.
+    // Wait for all in-flight arrayBuffer→sendBinary promises before audio_end.
+    // onstop fires before the last ondataavailable .then() resolves — without
+    // this, audio_end races ahead of the final binary chunk.
     await Promise.all(pendingSendsRef.current)
     pendingSendsRef.current = []
 
     setIsRecording(false)
 
+    // Send audio_end first, THEN release mic tracks.
+    // Releasing before sending could abort the last send on some browsers.
     sendMessageRef.current?.({ type: 'audio_end' })
-  }, [stopCurrentRecorder, stopLevelMeter, sendMessageRef])
+
+    // NOW release — headset can switch back to A2DP for AI playback
+    releaseMicTracks()
+  }, [stopCurrentRecorder, stopLevelMeter, releaseMicTracks, sendMessageRef])
 
   // ── playAudioChunk ─────────────────────────────────────────────────────────
-  //
-  // Bug fix vs original: the original had a gap where if playbackCursor was
-  // only slightly in the past (within PLAYBACK_LEAD_TIME), it would schedule
-  // to now+PLAYBACK_LEAD_TIME regardless, creating a growing delay over a long
-  // AI response. Now we only reset the cursor if it's significantly stale
-  // (>0.5s behind), otherwise we chain precisely to the previous chunk end.
   const playAudioChunk = useCallback((base64Audio) => {
     const ctx = audioContextRef.current
     if (!ctx) return
@@ -250,7 +244,7 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
       const bytes = new Uint8Array(binary.length)
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
 
-      // Validate: PCM f32le must be divisible by 4
+      // PCM f32le must be 4-byte aligned
       const alignedLength = bytes.length - (bytes.length % 4)
       if (alignedLength === 0) return
 
@@ -262,17 +256,14 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
 
       const source = ctx.createBufferSource()
       source.buffer = audioBuffer
-      // Route through playbackGain so we can control TTS volume independently
-      source.connect(playbackGainRef.current)
+      source.connect(ctx.destination)
 
       const now = ctx.currentTime
 
-      // If cursor is more than 500ms stale (gap between questions, pause, etc.)
-      // reset it. Otherwise chain precisely — this prevents cumulative drift.
-      const STALE_THRESHOLD = 0.5
-      if (playbackCursorRef.current < now - STALE_THRESHOLD) {
-        // Add a small 80ms lead to account for decode/scheduling jitter.
-        // Much smaller than the original 350ms which was causing noticeable lag.
+      // Reset cursor only if significantly stale (gap between questions).
+      // Within a continuous stream, chain chunks precisely — no added lead
+      // time per chunk, which was causing cumulative drift in the original.
+      if (playbackCursorRef.current < now - 0.5) {
         playbackCursorRef.current = now + 0.08
       }
 
@@ -284,7 +275,6 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     }
   }, [])
 
-  // Reset cursor — call before each AI turn so there's no gap from the previous one
   const resetPlaybackCursor = useCallback(() => {
     if (audioContextRef.current) {
       playbackCursorRef.current = audioContextRef.current.currentTime + 0.08
