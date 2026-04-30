@@ -127,6 +127,9 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
                             text_buffer = text_buffer[last_flush_idx+1:]
                             if to_send.strip():
                                 await ctx.send(
+                                    model_id=MODEL_ID,
+                                    voice=VOICE_SPEC,
+                                    output_format=OUTPUT_FORMAT,
                                     transcript=to_send,
                                     continue_=True
                                 )
@@ -134,6 +137,9 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
                     # Send any remaining text
                     if text_buffer.strip():
                         await ctx.send(
+                            model_id=MODEL_ID,
+                            voice=VOICE_SPEC,
+                            output_format=OUTPUT_FORMAT,
                             transcript=text_buffer + " ",
                             continue_=True
                         )
@@ -153,7 +159,7 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
                             audio = response.get("audio") if isinstance(response, dict) else getattr(response, "audio", None)
                             if audio:
                                 buffer += audio
-                                if len(buffer) >= 4096:
+                                if len(buffer) >= 16384:
                                     remainder = len(buffer) % 4
                                     valid_length = len(buffer) - remainder
                                     if valid_length > 0:
