@@ -15,7 +15,7 @@ OUTPUT_FORMAT = {
 VOICE_SPEC = {
     "id": VOICE_ID,
     "mode": "id",
-}git 
+}
 
 
 async def stream_tts(text: str) -> AsyncGenerator[bytes, None]:
