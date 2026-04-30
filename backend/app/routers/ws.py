@@ -127,20 +127,14 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
                             text_buffer = text_buffer[last_flush_idx+1:]
                             if to_send.strip():
                                 await ctx.send(
-                                    model_id=MODEL_ID,
-                                    voice=VOICE_SPEC,
-                                    output_format=OUTPUT_FORMAT,
                                     transcript=to_send,
                                     continue_=True
                                 )
                                 
                     # Send any remaining text
-                    if text_buffer:
+                    if text_buffer.strip():
                         await ctx.send(
-                            model_id=MODEL_ID,
-                            voice=VOICE_SPEC,
-                            output_format=OUTPUT_FORMAT,
-                            transcript=text_buffer,
+                            transcript=text_buffer + " ",
                             continue_=True
                         )
                 except Exception as e:
