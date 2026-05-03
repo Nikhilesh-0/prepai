@@ -13,6 +13,19 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
   const isRecordingRef = useRef(false)
   const pendingSendsRef = useRef([])
 
+  // ── getLeadTime ────────────────────────────────────────────────────────────
+  // Dynamically compute how far ahead of ctx.currentTime we should schedule
+  // the first audio chunk.  BT headphones expose higher outputLatency /
+  // baseLatency via the Web Audio API, so they automatically get a larger
+  // buffer runway (~250-400 ms) while wired / laptop speakers stay at ~80 ms.
+  const getLeadTime = useCallback(() => {
+    const ctx = audioContextRef.current
+    if (!ctx) return 0.08
+    const out = ctx.outputLatency || 0
+    const base = ctx.baseLatency || 0
+    return Math.max(0.08, out + base + 0.06)
+  }, [])
+
   const [isRecording, setIsRecording] = useState(false)
   const [isMuted, setIsMuted] = useState(false)
   const [audioLevel, setAudioLevel] = useState(0)
@@ -213,7 +226,7 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
       const now = ctx.currentTime
       // Only reset cursor if stale — don't add lead time per-chunk (causes drift)
       if (playbackCursorRef.current < now - 0.5) {
-        playbackCursorRef.current = now + 0.08
+        playbackCursorRef.current = now + getLeadTime()
       }
       const startAt = Math.max(playbackCursorRef.current, now)
       source.start(startAt)
@@ -228,10 +241,10 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
 
   const resetPlaybackCursor = useCallback(() => {
     if (audioContextRef.current) {
-      playbackCursorRef.current = audioContextRef.current.currentTime + 0.08
+      playbackCursorRef.current = audioContextRef.current.currentTime + getLeadTime()
       hasReceivedAudioRef.current = false
     }
-  }, [])
+  }, [getLeadTime])
 
   const getRemainingPlaybackMs = useCallback(() => {
     const ctx = audioContextRef.current
