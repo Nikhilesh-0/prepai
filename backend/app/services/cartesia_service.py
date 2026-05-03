@@ -27,15 +27,15 @@ async def stream_tts(text: str) -> AsyncGenerator[bytes, None]:
       returns AsyncIterator[bytes] — iterate directly, no context manager needed.
     """
     from cartesia import AsyncCartesia
-    
-    async with AsyncCartesia(api_key=settings.cartesia_api_key) as client:
-        audio_iter = await client.tts.bytes(
-            model_id=MODEL_ID,
-            transcript=text,
-            voice=VOICE_SPEC,
-            output_format=OUTPUT_FORMAT,
-        )
+    client = AsyncCartesia(api_key=settings.cartesia_api_key)
 
-        async for chunk in audio_iter:
-            if chunk:
-                yield chunk
+    audio_iter = await client.tts.bytes(
+        model_id=MODEL_ID,
+        transcript=text,
+        voice=VOICE_SPEC,
+        output_format=OUTPUT_FORMAT,
+    )
+
+    async for chunk in audio_iter:
+        if chunk:
+            yield chunk

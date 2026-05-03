@@ -109,12 +109,11 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
                 await sentence_queue.put(None)
 
         async def tts_worker():
-            try:
-                while True:
-                    sentence = await sentence_queue.get()
-                    if sentence is None:
-                        break
-                        
+            while True:
+                sentence = await sentence_queue.get()
+                if sentence is None:
+                    break
+                try:
                     buffer = b""
                     async for chunk in stream_tts(sentence):
                         buffer += chunk
@@ -136,8 +135,15 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
                             "type": "audio_response_chunk",
                             "audio": base64.b64encode(buffer).decode("utf-8"),
                         })
-            except Exception as e:
-                print(f"[TTS WORKER ERROR] {e}")
+                except Exception as e:
+                    import traceback
+                    err_msg = f"[TTS WORKER ERROR] {str(e)}\n{traceback.format_exc()}"
+                    print(err_msg)
+                    try:
+                        with open("tts_error.log", "w", encoding="utf-8") as f:
+                            f.write(err_msg)
+                    except:
+                        pass
 
         await asyncio.gather(text_sender(), tts_worker())
 
