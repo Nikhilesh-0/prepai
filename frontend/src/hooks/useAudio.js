@@ -12,8 +12,9 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
   const animFrameRef = useRef(null)
   const isRecordingRef = useRef(false)
   const pendingSendsRef = useRef([])
-  const silenceBufferRef = useRef(null)     // reusable AudioBuffer of zeros
-  const trailingSilenceRef = useRef(null)   // currently-scheduled silence source
+  const pcmQueueRef = useRef([])            // accumulated Float32Arrays awaiting flush
+  const pcmQueueLenRef = useRef(0)          // total sample count in the queue
+  const flushTimerRef = useRef(null)        // debounce timer for tail-end flush
 
   // ── getLeadTime ────────────────────────────────────────────────────────────
   // Dynamically compute how far ahead of ctx.currentTime we should schedule
@@ -71,13 +72,6 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
       osc.connect(gain)
       gain.connect(ctx.destination)
       osc.start()
-
-      // Pre-allocate a reusable silent buffer (500 ms of zeros).
-      // Scheduled after every real audio chunk to keep the BT A2DP
-      // codec buffer fed across inter-sentence TTS gaps.
-      silenceBufferRef.current = ctx.createBuffer(
-        CHANNELS, Math.ceil(SAMPLE_RATE * 0.5), SAMPLE_RATE,
-      )
     } else if (audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume()
     }
@@ -208,7 +202,49 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     releaseMicTracks()
   }, [stopCurrentRecorder, stopLevelMeter, releaseMicTracks, sendMessageRef])
 
+  // ── flushPcmQueue ───────────────────────────────────────────────────────────
+  // Merge all accumulated PCM data into ONE AudioBufferSourceNode and schedule
+  // it.  Fewer, larger buffers (~250 ms each) prevent the micro-discontinuities
+  // that cause BT A2DP codecs to drop audio.  On wired outputs the only
+  // observable effect is a negligible scheduling delay (~120 ms max).
+  const flushPcmQueue = useCallback(() => {
+    clearTimeout(flushTimerRef.current)
+    flushTimerRef.current = null
+
+    const ctx = audioContextRef.current
+    const queue = pcmQueueRef.current
+    if (!ctx || queue.length === 0) return
+
+    // Merge queued arrays into one contiguous Float32Array
+    const totalSamples = pcmQueueLenRef.current
+    const merged = new Float32Array(totalSamples)
+    let off = 0
+    for (const arr of queue) { merged.set(arr, off); off += arr.length }
+    pcmQueueRef.current = []
+    pcmQueueLenRef.current = 0
+
+    const audioBuffer = ctx.createBuffer(CHANNELS, merged.length, SAMPLE_RATE)
+    audioBuffer.getChannelData(0).set(merged)
+
+    const source = ctx.createBufferSource()
+    source.buffer = audioBuffer
+    source.connect(ctx.destination)
+
+    const now = ctx.currentTime
+    if (playbackCursorRef.current < now - 0.5) {
+      playbackCursorRef.current = now + getLeadTime()
+    }
+    const startAt = Math.max(playbackCursorRef.current, now)
+    source.start(startAt)
+    playbackCursorRef.current = startAt + audioBuffer.duration
+    hasReceivedAudioRef.current = true
+  }, [getLeadTime])
+
   // ── playAudioChunk ─────────────────────────────────────────────────────────
+  // Decodes a base64 PCM chunk and queues it.  Flushes immediately once ~250 ms
+  // of audio has accumulated, or after a 120 ms idle timeout (for tail data).
+  const FLUSH_SAMPLES = Math.ceil(SAMPLE_RATE * 0.25) // ~250 ms
+
   const playAudioChunk = useCallback((base64Audio) => {
     const ctx = audioContextRef.current
     if (!ctx) return
@@ -225,52 +261,30 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
       const float32 = new Float32Array(bytes.buffer, 0, alignedLength / 4)
       if (float32.length === 0) return
 
-      const audioBuffer = ctx.createBuffer(CHANNELS, float32.length, SAMPLE_RATE)
-      audioBuffer.getChannelData(0).set(float32)
+      // Accumulate instead of scheduling immediately
+      pcmQueueRef.current.push(float32)
+      pcmQueueLenRef.current += float32.length
 
-      const source = ctx.createBufferSource()
-      source.buffer = audioBuffer
-      source.connect(ctx.destination)
-
-      const now = ctx.currentTime
-      // Only reset cursor if stale — don't add lead time per-chunk (causes drift)
-      if (playbackCursorRef.current < now - 0.5) {
-        playbackCursorRef.current = now + getLeadTime()
+      clearTimeout(flushTimerRef.current)
+      if (pcmQueueLenRef.current >= FLUSH_SAMPLES) {
+        flushPcmQueue()
+      } else {
+        flushTimerRef.current = setTimeout(flushPcmQueue, 120)
       }
-      const startAt = Math.max(playbackCursorRef.current, now)
-      source.start(startAt)
-      playbackCursorRef.current = startAt + audioBuffer.duration
-
-      // ── Trailing silence for BT ───────────────────────────────────────
-      // Cancel the previous trailing silence (a new real chunk arrived).
-      // Then schedule a fresh 500 ms silent buffer right after this chunk.
-      // If no more chunks arrive (inter-sentence gap), the silence keeps
-      // the BT codec buffer fed.  On wired outputs mixing zeros with
-      // audio is a no-op, so this is completely transparent.
-      if (trailingSilenceRef.current) {
-        try { trailingSilenceRef.current.stop() } catch (_) { /* already stopped */ }
-      }
-      if (silenceBufferRef.current) {
-        const sil = ctx.createBufferSource()
-        sil.buffer = silenceBufferRef.current
-        sil.connect(ctx.destination)
-        sil.start(playbackCursorRef.current)  // starts right after real audio
-        trailingSilenceRef.current = sil
-        // Do NOT advance playbackCursorRef — silence is just insurance
-      }
-
-      // Mark that audio has started arriving for this turn
-      hasReceivedAudioRef.current = true
     } catch (err) {
       console.error('Audio playback error:', err)
     }
-  }, [])
+  }, [flushPcmQueue])
 
   const resetPlaybackCursor = useCallback(() => {
     if (audioContextRef.current) {
       playbackCursorRef.current = audioContextRef.current.currentTime + getLeadTime()
       hasReceivedAudioRef.current = false
     }
+    // Discard any leftover PCM data from a previous turn
+    clearTimeout(flushTimerRef.current)
+    pcmQueueRef.current = []
+    pcmQueueLenRef.current = 0
   }, [getLeadTime])
 
   const getRemainingPlaybackMs = useCallback(() => {
