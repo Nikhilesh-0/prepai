@@ -7,11 +7,11 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
   const audioContextRef = useRef(null)
   const mediaRecorderRef = useRef(null)
   const micStreamRef = useRef(null)
-  const hasReceivedAudioRef = useRef(false)  // true once first chunk of current turn arrives
+  const playbackCursorRef = useRef(0)
+  const hasReceivedAudioRef = useRef(false)  // true once first chunk of current turn is scheduled
   const animFrameRef = useRef(null)
   const isRecordingRef = useRef(false)
   const pendingSendsRef = useRef([])
-  const audioPlayQueueRef = useRef(new Float32Array(0))  // PCM sample queue for playback
 
   const [isRecording, setIsRecording] = useState(false)
   const [isMuted, setIsMuted] = useState(false)
@@ -40,8 +40,6 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
 
   // ── AudioContext — created once, never closed ──────────────────────────────
   // Keepalive oscillator prevents BT noise gate from engaging during silence.
-  // ScriptProcessorNode provides a continuous pull-based audio stream so the
-  // BT A2DP codec never sees node start/stop transitions.
   const initAudioContext = useCallback(() => {
     if (!audioContextRef.current) {
       const ctx = new (window.AudioContext || window.webkitAudioContext)({
@@ -58,30 +56,10 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
       osc.connect(gain)
       gain.connect(ctx.destination)
       osc.start()
-
-      // Continuous playback processor — always outputs samples so BT codecs
-      // never see audio stream discontinuities.  Pulls from audioPlayQueueRef.
-      const processor = ctx.createScriptProcessor(4096, 0, 1)
-      processor.onaudioprocess = (e) => {
-        const output = e.outputBuffer.getChannelData(0)
-        const queue = audioPlayQueueRef.current
-        const needed = output.length
-
-        if (queue.length >= needed) {
-          output.set(queue.subarray(0, needed))
-          audioPlayQueueRef.current = queue.slice(needed)
-        } else if (queue.length > 0) {
-          output.set(queue)
-          for (let i = queue.length; i < needed; i++) output[i] = 0
-          audioPlayQueueRef.current = new Float32Array(0)
-        } else {
-          for (let i = 0; i < needed; i++) output[i] = 0
-        }
-      }
-      processor.connect(ctx.destination)
     } else if (audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume()
     }
+    playbackCursorRef.current = audioContextRef.current.currentTime
     return audioContextRef.current
   }, [])
 
@@ -209,9 +187,6 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
   }, [stopCurrentRecorder, stopLevelMeter, releaseMicTracks, sendMessageRef])
 
   // ── playAudioChunk ─────────────────────────────────────────────────────────
-  // Decodes a base64 PCM chunk and appends samples to the playback queue.
-  // The ScriptProcessorNode in initAudioContext pulls from this queue
-  // continuously, so there are never discrete AudioNode start/stop events.
   const playAudioChunk = useCallback((base64Audio) => {
     const ctx = audioContextRef.current
     if (!ctx) return
@@ -228,13 +203,23 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
       const float32 = new Float32Array(bytes.buffer, 0, alignedLength / 4)
       if (float32.length === 0) return
 
-      // Append to the continuous playback queue
-      const current = audioPlayQueueRef.current
-      const merged = new Float32Array(current.length + float32.length)
-      merged.set(current)
-      merged.set(float32, current.length)
-      audioPlayQueueRef.current = merged
+      const audioBuffer = ctx.createBuffer(CHANNELS, float32.length, SAMPLE_RATE)
+      audioBuffer.getChannelData(0).set(float32)
 
+      const source = ctx.createBufferSource()
+      source.buffer = audioBuffer
+      source.connect(ctx.destination)
+
+      const now = ctx.currentTime
+      // Only reset cursor if stale — don't add lead time per-chunk (causes drift)
+      if (playbackCursorRef.current < now - 0.5) {
+        playbackCursorRef.current = now + 0.08
+      }
+      const startAt = Math.max(playbackCursorRef.current, now)
+      source.start(startAt)
+      playbackCursorRef.current = startAt + audioBuffer.duration
+
+      // Mark that audio has started arriving for this turn
       hasReceivedAudioRef.current = true
     } catch (err) {
       console.error('Audio playback error:', err)
@@ -242,18 +227,22 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
   }, [])
 
   const resetPlaybackCursor = useCallback(() => {
-    audioPlayQueueRef.current = new Float32Array(0)
-    hasReceivedAudioRef.current = false
+    if (audioContextRef.current) {
+      playbackCursorRef.current = audioContextRef.current.currentTime + 0.08
+      hasReceivedAudioRef.current = false
+    }
   }, [])
 
   const getRemainingPlaybackMs = useCallback(() => {
-    return Math.max(0, (audioPlayQueueRef.current.length / SAMPLE_RATE) * 1000)
+    const ctx = audioContextRef.current
+    if (!ctx) return 0
+    return Math.max(0, (playbackCursorRef.current - ctx.currentTime) * 1000)
   }, [])
 
-  // True only once the first chunk has arrived AND the queue has been drained
+  // True only once the first chunk has been scheduled AND the scheduler is empty
   const isPlaybackTrulyDone = useCallback(() => {
-    return hasReceivedAudioRef.current && audioPlayQueueRef.current.length === 0
-  }, [])
+    return hasReceivedAudioRef.current && getRemainingPlaybackMs() === 0
+  }, [getRemainingPlaybackMs])
 
   const toggleMute = useCallback(() => setIsMutedWrapped(p => !p), [setIsMutedWrapped])
 
