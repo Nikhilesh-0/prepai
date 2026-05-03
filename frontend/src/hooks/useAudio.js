@@ -7,27 +7,11 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
   const audioContextRef = useRef(null)
   const mediaRecorderRef = useRef(null)
   const micStreamRef = useRef(null)
-  const playbackCursorRef = useRef(0)
-  const hasReceivedAudioRef = useRef(false)  // true once first chunk of current turn is scheduled
+  const hasReceivedAudioRef = useRef(false)  // true once first chunk of current turn arrives
   const animFrameRef = useRef(null)
   const isRecordingRef = useRef(false)
   const pendingSendsRef = useRef([])
-  const pcmQueueRef = useRef([])            // accumulated Float32Arrays awaiting flush
-  const pcmQueueLenRef = useRef(0)          // total sample count in the queue
-  const flushTimerRef = useRef(null)        // debounce timer for tail-end flush
-
-  // ── getLeadTime ────────────────────────────────────────────────────────────
-  // Dynamically compute how far ahead of ctx.currentTime we should schedule
-  // the first audio chunk.  BT headphones expose higher outputLatency /
-  // baseLatency via the Web Audio API, so they automatically get a larger
-  // buffer runway (~250-400 ms) while wired / laptop speakers stay at ~80 ms.
-  const getLeadTime = useCallback(() => {
-    const ctx = audioContextRef.current
-    if (!ctx) return 0.08
-    const out = ctx.outputLatency || 0
-    const base = ctx.baseLatency || 0
-    return Math.max(0.08, out + base + 0.06)
-  }, [])
+  const audioPlayQueueRef = useRef(new Float32Array(0))  // PCM sample queue for playback
 
   const [isRecording, setIsRecording] = useState(false)
   const [isMuted, setIsMuted] = useState(false)
@@ -56,6 +40,8 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
 
   // ── AudioContext — created once, never closed ──────────────────────────────
   // Keepalive oscillator prevents BT noise gate from engaging during silence.
+  // ScriptProcessorNode provides a continuous pull-based audio stream so the
+  // BT A2DP codec never sees node start/stop transitions.
   const initAudioContext = useCallback(() => {
     if (!audioContextRef.current) {
       const ctx = new (window.AudioContext || window.webkitAudioContext)({
@@ -72,10 +58,30 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
       osc.connect(gain)
       gain.connect(ctx.destination)
       osc.start()
+
+      // Continuous playback processor — always outputs samples so BT codecs
+      // never see audio stream discontinuities.  Pulls from audioPlayQueueRef.
+      const processor = ctx.createScriptProcessor(4096, 0, 1)
+      processor.onaudioprocess = (e) => {
+        const output = e.outputBuffer.getChannelData(0)
+        const queue = audioPlayQueueRef.current
+        const needed = output.length
+
+        if (queue.length >= needed) {
+          output.set(queue.subarray(0, needed))
+          audioPlayQueueRef.current = queue.slice(needed)
+        } else if (queue.length > 0) {
+          output.set(queue)
+          for (let i = queue.length; i < needed; i++) output[i] = 0
+          audioPlayQueueRef.current = new Float32Array(0)
+        } else {
+          for (let i = 0; i < needed; i++) output[i] = 0
+        }
+      }
+      processor.connect(ctx.destination)
     } else if (audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume()
     }
-    playbackCursorRef.current = audioContextRef.current.currentTime
     return audioContextRef.current
   }, [])
 
@@ -202,49 +208,10 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     releaseMicTracks()
   }, [stopCurrentRecorder, stopLevelMeter, releaseMicTracks, sendMessageRef])
 
-  // ── flushPcmQueue ───────────────────────────────────────────────────────────
-  // Merge all accumulated PCM data into ONE AudioBufferSourceNode and schedule
-  // it.  Fewer, larger buffers (~250 ms each) prevent the micro-discontinuities
-  // that cause BT A2DP codecs to drop audio.  On wired outputs the only
-  // observable effect is a negligible scheduling delay (~120 ms max).
-  const flushPcmQueue = useCallback(() => {
-    clearTimeout(flushTimerRef.current)
-    flushTimerRef.current = null
-
-    const ctx = audioContextRef.current
-    const queue = pcmQueueRef.current
-    if (!ctx || queue.length === 0) return
-
-    // Merge queued arrays into one contiguous Float32Array
-    const totalSamples = pcmQueueLenRef.current
-    const merged = new Float32Array(totalSamples)
-    let off = 0
-    for (const arr of queue) { merged.set(arr, off); off += arr.length }
-    pcmQueueRef.current = []
-    pcmQueueLenRef.current = 0
-
-    const audioBuffer = ctx.createBuffer(CHANNELS, merged.length, SAMPLE_RATE)
-    audioBuffer.getChannelData(0).set(merged)
-
-    const source = ctx.createBufferSource()
-    source.buffer = audioBuffer
-    source.connect(ctx.destination)
-
-    const now = ctx.currentTime
-    if (playbackCursorRef.current < now - 0.5) {
-      playbackCursorRef.current = now + getLeadTime()
-    }
-    const startAt = Math.max(playbackCursorRef.current, now)
-    source.start(startAt)
-    playbackCursorRef.current = startAt + audioBuffer.duration
-    hasReceivedAudioRef.current = true
-  }, [getLeadTime])
-
   // ── playAudioChunk ─────────────────────────────────────────────────────────
-  // Decodes a base64 PCM chunk and queues it.  Flushes immediately once ~250 ms
-  // of audio has accumulated, or after a 120 ms idle timeout (for tail data).
-  const FLUSH_SAMPLES = Math.ceil(SAMPLE_RATE * 0.25) // ~250 ms
-
+  // Decodes a base64 PCM chunk and appends samples to the playback queue.
+  // The ScriptProcessorNode in initAudioContext pulls from this queue
+  // continuously, so there are never discrete AudioNode start/stop events.
   const playAudioChunk = useCallback((base64Audio) => {
     const ctx = audioContextRef.current
     if (!ctx) return
@@ -261,42 +228,32 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
       const float32 = new Float32Array(bytes.buffer, 0, alignedLength / 4)
       if (float32.length === 0) return
 
-      // Accumulate instead of scheduling immediately
-      pcmQueueRef.current.push(float32)
-      pcmQueueLenRef.current += float32.length
+      // Append to the continuous playback queue
+      const current = audioPlayQueueRef.current
+      const merged = new Float32Array(current.length + float32.length)
+      merged.set(current)
+      merged.set(float32, current.length)
+      audioPlayQueueRef.current = merged
 
-      clearTimeout(flushTimerRef.current)
-      if (pcmQueueLenRef.current >= FLUSH_SAMPLES) {
-        flushPcmQueue()
-      } else {
-        flushTimerRef.current = setTimeout(flushPcmQueue, 120)
-      }
+      hasReceivedAudioRef.current = true
     } catch (err) {
       console.error('Audio playback error:', err)
     }
-  }, [flushPcmQueue])
-
-  const resetPlaybackCursor = useCallback(() => {
-    if (audioContextRef.current) {
-      playbackCursorRef.current = audioContextRef.current.currentTime + getLeadTime()
-      hasReceivedAudioRef.current = false
-    }
-    // Discard any leftover PCM data from a previous turn
-    clearTimeout(flushTimerRef.current)
-    pcmQueueRef.current = []
-    pcmQueueLenRef.current = 0
-  }, [getLeadTime])
-
-  const getRemainingPlaybackMs = useCallback(() => {
-    const ctx = audioContextRef.current
-    if (!ctx) return 0
-    return Math.max(0, (playbackCursorRef.current - ctx.currentTime) * 1000)
   }, [])
 
-  // True only once the first chunk has been scheduled AND the scheduler is empty
+  const resetPlaybackCursor = useCallback(() => {
+    audioPlayQueueRef.current = new Float32Array(0)
+    hasReceivedAudioRef.current = false
+  }, [])
+
+  const getRemainingPlaybackMs = useCallback(() => {
+    return Math.max(0, (audioPlayQueueRef.current.length / SAMPLE_RATE) * 1000)
+  }, [])
+
+  // True only once the first chunk has arrived AND the queue has been drained
   const isPlaybackTrulyDone = useCallback(() => {
-    return hasReceivedAudioRef.current && getRemainingPlaybackMs() === 0
-  }, [getRemainingPlaybackMs])
+    return hasReceivedAudioRef.current && audioPlayQueueRef.current.length === 0
+  }, [])
 
   const toggleMute = useCallback(() => setIsMutedWrapped(p => !p), [setIsMutedWrapped])
 
