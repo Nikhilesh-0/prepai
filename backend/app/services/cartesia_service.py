@@ -18,18 +18,6 @@ VOICE_SPEC = {
     "mode": "id",
 }
 
-# Module-level client — reused across all TTS calls to avoid leaking
-# HTTP sessions.  The client is lightweight and safe to share.
-_client: AsyncCartesia | None = None
-
-
-def _get_client() -> AsyncCartesia:
-    global _client
-    if _client is None:
-        _client = AsyncCartesia(api_key=settings.cartesia_api_key)
-    return _client
-
-
 async def stream_tts(text: str) -> AsyncGenerator[bytes, None]:
     """
     Stream TTS audio bytes from Cartesia using SDK v3.
@@ -38,15 +26,16 @@ async def stream_tts(text: str) -> AsyncGenerator[bytes, None]:
       client.tts.bytes(model_id, output_format, transcript, voice)
       returns AsyncIterator[bytes] — iterate directly, no context manager needed.
     """
-    client = _get_client()
+    from cartesia import AsyncCartesia
+    
+    async with AsyncCartesia(api_key=settings.cartesia_api_key) as client:
+        audio_iter = await client.tts.bytes(
+            model_id=MODEL_ID,
+            transcript=text,
+            voice=VOICE_SPEC,
+            output_format=OUTPUT_FORMAT,
+        )
 
-    audio_iter = await client.tts.bytes(
-        model_id=MODEL_ID,
-        transcript=text,
-        voice=VOICE_SPEC,
-        output_format=OUTPUT_FORMAT,
-    )
-
-    async for chunk in audio_iter:
-        if chunk:
-            yield chunk
+        async for chunk in audio_iter:
+            if chunk:
+                yield chunk
