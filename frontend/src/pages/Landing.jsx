@@ -1,19 +1,7 @@
-import React, { useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { supabase } from '../lib/supabase'
+import React from 'react'
 import GoogleSignIn from '../components/auth/GoogleSignIn'
 
 export default function Landing() {
-  const navigate = useNavigate()
-
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (session) {
-        navigate('/dashboard', { replace: true })
-      }
-    })
-  }, [navigate])
-
   return (
     <div style={{
       minHeight: '100vh',

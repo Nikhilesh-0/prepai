@@ -113,8 +113,9 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     })
   }, [])
 
-
   // ── markNewAiTurn ──────────────────────────────────────────────────────────
+  // Called by useInterview when a new AI turn begins (first audio_response_chunk).
+  // Resets the flag so the poll in useInterview knows audio has started arriving.
   const markNewAiTurn = useCallback(() => {
     hasReceivedAudioRef.current = false
   }, [])
@@ -240,7 +241,7 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
 
   // True only once the first chunk has been scheduled AND the scheduler is empty
   const isPlaybackTrulyDone = useCallback(() => {
-    return hasReceivedAudioRef.current && getRemainingPlaybackMs() <= 0
+    return hasReceivedAudioRef.current && getRemainingPlaybackMs() === 0
   }, [getRemainingPlaybackMs])
 
   const toggleMute = useCallback(() => setIsMutedWrapped(p => !p), [setIsMutedWrapped])

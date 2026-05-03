@@ -183,3 +183,73 @@ def count_filler_words(transcript: str) -> int:
 
     return total
 
+
+def detect_sentence_boundaries(text: str) -> list[str]:
+    """
+    Split text into sentences at . ? ! boundaries.
+    Handles abbreviations to avoid false splits.
+    Returns list of sentences.
+    """
+    sentences = []
+    current = ""
+    i = 0
+
+    while i < len(text):
+        char = text[i]
+        current += char
+
+        if char in ".!?":
+            # Check if this is an abbreviation
+            word_before = ""
+            j = i - 1
+            while j >= 0 and text[j].isalpha():
+                word_before = text[j] + word_before
+                j -= 1
+
+            is_abbreviation = word_before.lower() in ABBREVIATIONS
+
+            # Check for multiple punctuation (e.g., ...)
+            if i + 1 < len(text) and text[i + 1] in ".!?":
+                i += 1
+                continue
+
+            if not is_abbreviation:
+                # Check if followed by space or end of string
+                if i + 1 >= len(text) or text[i + 1] == " " or text[i + 1] == "\n":
+                    sentence = current.strip()
+                    if sentence:
+                        sentences.append(sentence)
+                    current = ""
+
+        i += 1
+
+    # Add any remaining text
+    if current.strip():
+        sentences.append(current.strip())
+
+    return sentences
+
+
+def split_into_tts_chunks(text: str) -> list[str]:
+    """
+    Split text into chunks suitable for TTS — sentence by sentence.
+    Merge very short sentences with the next one.
+    """
+    sentences = detect_sentence_boundaries(text)
+    chunks = []
+    buffer = ""
+
+    for sentence in sentences:
+        if not sentence.strip():
+            continue
+        if len(buffer) + len(sentence) < 20 and buffer:
+            buffer += " " + sentence
+        else:
+            if buffer:
+                chunks.append(buffer.strip())
+            buffer = sentence
+
+    if buffer.strip():
+        chunks.append(buffer.strip())
+
+    return chunks if chunks else [text]

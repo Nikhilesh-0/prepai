@@ -32,7 +32,7 @@ export default function useInterview(sessionId) {
   const pollRef = useRef(null)
   const speakingDoneAtRef = useRef(null)   // timestamp when speaking_done arrived
 
-  const { connectionState, sendMessage, sendBinary, onMessage } = useWebSocket(sessionId)
+  const { connectionState, sendMessage, sendBinary, onBinary, onMessage } = useWebSocket(sessionId)
   const sendMessageRef = useRef(sendMessage)
   const sendBinaryRef = useRef(sendBinary)
   useEffect(() => { sendMessageRef.current = sendMessage }, [sendMessage])
@@ -63,6 +63,8 @@ export default function useInterview(sessionId) {
   useEffect(() => { playAudioChunkRef.current = playAudioChunk }, [playAudioChunk])
   useEffect(() => { getRemainingPlaybackMsRef.current = getRemainingPlaybackMs }, [getRemainingPlaybackMs])
   useEffect(() => { isPlaybackTrulyDoneRef.current = isPlaybackTrulyDone }, [isPlaybackTrulyDone])
+
+  useEffect(() => { onBinary(() => { }) }, [onBinary])
 
   const cancelPoll = useCallback(() => {
     if (pollRef.current) {

@@ -1,6 +1,5 @@
 from typing import AsyncGenerator
 from app.core.config import settings
-from cartesia import AsyncCartesia
 
 VOICE_ID = "79a125e8-cd45-4c13-8a67-188112f4dd22"  # Christopher — calm, authoritative
 MODEL_ID = "sonic-english"
@@ -18,6 +17,7 @@ VOICE_SPEC = {
     "mode": "id",
 }
 
+
 async def stream_tts(text: str) -> AsyncGenerator[bytes, None]:
     """
     Stream TTS audio bytes from Cartesia using SDK v3.
@@ -27,6 +27,7 @@ async def stream_tts(text: str) -> AsyncGenerator[bytes, None]:
       returns AsyncIterator[bytes] — iterate directly, no context manager needed.
     """
     from cartesia import AsyncCartesia
+
     client = AsyncCartesia(api_key=settings.cartesia_api_key)
 
     audio_iter = await client.tts.bytes(
