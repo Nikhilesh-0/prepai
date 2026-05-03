@@ -1,6 +1,6 @@
 # PrepAI — AI Mock Interviewer
 
-A real-time, voice-based AI mock interviewer. Paste a job description, speak your answers, and receive a scored performance report with per-answer deterministic analysis.
+A real-time, voice-based AI mock interviewer. Paste a job description, speak your answers, and receive a scored performance report with deterministic analysis.
 
 **Live demo:** [prepai-navy.vercel.app](https://prepai-navy.vercel.app)
 
@@ -11,7 +11,7 @@ A real-time, voice-based AI mock interviewer. Paste a job description, speak you
 | Layer | Technology |
 |---|---|
 | Frontend | React 18 + Vite + Tailwind CSS → Vercel |
-| Backend | FastAPI + WebSockets → Koyeb (Dockerized) |
+| Backend | FastAPI + WebSockets → Render (Dockerized) |
 | Speech-to-Text | Groq `whisper-large-v3` |
 | LLM | Groq `llama-3.3-70b-versatile` (streaming) |
 | Text-to-Speech | Cartesia `sonic-english`, voice: Christopher (`79a125e8`) |
@@ -87,7 +87,7 @@ Each answer is evaluated in real-time using `answer_evaluator.py` — no extra L
 Labels: `strong`, `adequate`, `vague`, `off_topic`, `too_short`, `no_response`, `skipped`.
 
 ### 4. Scorecard Generation
-After the final question, a joblib-loaded Random Forest model takes aggregate features from all per-answer evaluations (mean TTR, total tech terms, filler counts, etc.) to produce deterministic numeric scores for overall, technical, communication, and confidence dimensions. These scores are passed to LLaMA 3.3 70B as ground truth — the LLM is instructed to generate text feedback that is **consistent with the numeric scores**, not the other way around. The scorecard is persisted to Supabase and includes per-answer STAR breakdowns visible in the frontend.
+After the final question, a joblib-loaded Random Forest model takes aggregate features from all per-answer evaluations (mean TTR, total tech terms, filler counts, etc.) to produce deterministic numeric scores for overall, technical, communication, and confidence dimensions. These scores are passed to LLaMA 3.3 70B as ground truth — the LLM is instructed to generate text feedback that is **consistent with the numeric scores**, not the other way around. The scorecard is persisted to Supabase and displayed as a single overall performance report: four score rings, filler word count, strengths, areas for improvement, a written summary, and per-dimension detailed feedback.
 
 ---
 
@@ -271,24 +271,26 @@ create trigger on_auth_user_created
 
 ## Deployment
 
-### Backend → Koyeb
+### Backend → Render
 
-1. Go to [koyeb.com](https://koyeb.com) → **New App → GitHub** → select this repo
-2. Set **root directory** to `backend`
-3. Koyeb auto-detects the `Dockerfile` (Python 3.11-slim, uvicorn on port 8000)
+1. Go to [render.com](https://render.com) → **New → Web Service** → connect this repo
+2. Set **Root Directory** to `backend`
+3. Render auto-detects the `Dockerfile` (Python 3.11-slim, uvicorn on port 8000)
 4. Add all backend environment variables
 5. Set `FRONTEND_URL` to your Vercel URL after deploying the frontend
-6. Deploy — copy the generated `https://prepai-xyz.koyeb.app` URL
+6. Deploy — copy the generated `https://prepai-xyz.onrender.com` URL
+
+> **Note:** Render free-tier web services spin down after inactivity. The WebSocket keepalive ping (every 25s) helps prevent idle disconnections during active interviews, but the first request after a cold start may take ~30s.
 
 ### Frontend → Vercel
 
 1. Go to [vercel.com](https://vercel.com) → **New Project** → import this repo
 2. Set **root directory** to `frontend`, framework preset to **Vite**
 3. Add all frontend environment variables:
-   - `VITE_BACKEND_URL` → your Koyeb URL (`https://...`)
+   - `VITE_BACKEND_URL` → your Render URL (`https://...`)
    - `VITE_WS_URL` → same URL with `wss://` protocol
 4. Deploy — copy the Vercel URL
-5. Go back to Koyeb → update `FRONTEND_URL` to the Vercel URL → **redeploy backend**
+5. Go back to Render → update `FRONTEND_URL` to the Vercel URL → **redeploy backend**
 
 ### Supabase: Post-Deployment
 
@@ -301,7 +303,7 @@ create trigger on_auth_user_created
 
 **WebSocket connection fails**
 - Confirm `VITE_WS_URL` uses `wss://` not `https://`
-- Check Koyeb logs for Python errors on connect
+- Check Render logs for Python errors on connect
 - Ensure `FRONTEND_URL` in the backend env exactly matches your Vercel URL (CORS)
 
 **Audio not playing**
@@ -323,4 +325,4 @@ create trigger on_auth_user_created
 
 **CORS errors**
 - Ensure `FRONTEND_URL` in the backend env matches your Vercel URL exactly
-- Redeploy the backend after updating env vars
+- Redeploy the backend on Render after updating env vars
