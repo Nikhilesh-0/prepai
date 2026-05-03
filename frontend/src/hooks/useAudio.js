@@ -12,6 +12,8 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
   const animFrameRef = useRef(null)
   const isRecordingRef = useRef(false)
   const pendingSendsRef = useRef([])
+  const silenceBufferRef = useRef(null)     // reusable AudioBuffer of zeros
+  const trailingSilenceRef = useRef(null)   // currently-scheduled silence source
 
   // ── getLeadTime ────────────────────────────────────────────────────────────
   // Dynamically compute how far ahead of ctx.currentTime we should schedule
@@ -69,6 +71,13 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
       osc.connect(gain)
       gain.connect(ctx.destination)
       osc.start()
+
+      // Pre-allocate a reusable silent buffer (500 ms of zeros).
+      // Scheduled after every real audio chunk to keep the BT A2DP
+      // codec buffer fed across inter-sentence TTS gaps.
+      silenceBufferRef.current = ctx.createBuffer(
+        CHANNELS, Math.ceil(SAMPLE_RATE * 0.5), SAMPLE_RATE,
+      )
     } else if (audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume()
     }
@@ -231,6 +240,24 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
       const startAt = Math.max(playbackCursorRef.current, now)
       source.start(startAt)
       playbackCursorRef.current = startAt + audioBuffer.duration
+
+      // ── Trailing silence for BT ───────────────────────────────────────
+      // Cancel the previous trailing silence (a new real chunk arrived).
+      // Then schedule a fresh 500 ms silent buffer right after this chunk.
+      // If no more chunks arrive (inter-sentence gap), the silence keeps
+      // the BT codec buffer fed.  On wired outputs mixing zeros with
+      // audio is a no-op, so this is completely transparent.
+      if (trailingSilenceRef.current) {
+        try { trailingSilenceRef.current.stop() } catch (_) { /* already stopped */ }
+      }
+      if (silenceBufferRef.current) {
+        const sil = ctx.createBufferSource()
+        sil.buffer = silenceBufferRef.current
+        sil.connect(ctx.destination)
+        sil.start(playbackCursorRef.current)  // starts right after real audio
+        trailingSilenceRef.current = sil
+        // Do NOT advance playbackCursorRef — silence is just insurance
+      }
 
       // Mark that audio has started arriving for this turn
       hasReceivedAudioRef.current = true
