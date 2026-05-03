@@ -2,23 +2,16 @@ import json
 import base64
 import asyncio
 import traceback
-import math
-import struct
 from datetime import datetime, timezone
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from app.core.session_manager import session_manager
 from app.services.groq_service import transcribe_audio, stream_interviewer_response, generate_scorecard
-from app.services.cartesia_service import stream_tts, MODEL_ID, VOICE_SPEC, OUTPUT_FORMAT
-from cartesia import AsyncCartesia
-from app.core.config import settings
+from app.services.cartesia_service import stream_tts
 from app.services.answer_evaluator import evaluate_answer
-from app.services.interview_logic import count_filler_words, split_into_tts_chunks
+from app.services.interview_logic import count_filler_words, ABBREVIATIONS
 from app.services import supabase_service
 
 router = APIRouter(tags=["websocket"])
-
-PCM_F32LE_SAMPLE_RATE = 44100
-PCM_F32LE_BYTES_PER_SAMPLE = 4
 
 
 def build_state_update(session: dict) -> dict:
@@ -43,9 +36,6 @@ async def send_json(ws: WebSocket, data: dict):
         pass
 
 
-# Cartesia TTS Streaming logic is now embedded directly in handle_ai_turn
-
-
 async def handle_ai_turn(ws: WebSocket, session_id: str):
     """
     Run one full AI turn. Always sends speaking_done at the end,
@@ -60,16 +50,12 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
     await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
 
     full_response = ""
-    sentence_buffer = ""
-    tts_failed = False
-    audio_chunk_count = 0
 
     try:
         sentence_queue = asyncio.Queue()
 
         async def text_sender():
             nonlocal full_response
-            from app.services.interview_logic import ABBREVIATIONS
             try:
                 text_buffer = ""
                 async for text_chunk in stream_interviewer_response(
@@ -166,9 +152,6 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
     if full_response:
         await session_manager.add_conversation_turn(session_id, "ai", full_response)
 
-    if tts_failed:
-        await send_json(ws, {"type": "error", "message": "Audio unavailable — reading text only"})
-
     # ALWAYS send speaking_done so the frontend can transition to listening
     await send_json(ws, {"type": "speaking_done"})
 
@@ -178,6 +161,38 @@ async def handle_ai_turn(ws: WebSocket, session_id: str):
     })
     await send_json(ws, build_state_update(await session_manager.get_session(session_id)))
 
+
+
+async def finalize_interview(ws: WebSocket, session_id: str):
+    """Generate scorecard, save to DB, and send interview_complete."""
+    await send_json(ws, {"type": "processing_start"})
+    final_session = await session_manager.get_session(session_id)
+
+    scorecard_data = await generate_scorecard(
+        conversation_history=final_session["conversation_history"],
+        interview_profile=final_session["interview_profile"],
+        filler_counts=final_session.get("filler_word_counts", []),
+        answer_evaluations=final_session.get("answer_evaluations", []),
+    )
+    scorecard_data["session_id"] = session_id
+    scorecard_data["answer_evaluations"] = final_session.get("answer_evaluations", [])
+    scorecard_data["question_plan"] = final_session.get("question_plan", [])
+
+    try:
+        await supabase_service.save_scorecard(scorecard_data)
+        await supabase_service.update_session_status(
+            session_id, "completed", datetime.now(timezone.utc)
+        )
+    except Exception:
+        pass
+
+    await send_json(ws, {
+        "type": "interview_complete",
+        "session_id": session_id,
+        "scorecard": scorecard_data,
+    })
+
+    await session_manager.delete_session(session_id)
 
 
 async def restore_session_from_db(session_id: str) -> bool:
@@ -286,7 +301,8 @@ async def interview_websocket(ws: WebSocket, session_id: str):
             current_question = ""
             if current_idx < len(current_session.get("question_plan", [])):
                 current_question = current_session["question_plan"][current_idx].get("question", "")
-            answer_evaluation = evaluate_answer(
+            answer_evaluation = await asyncio.to_thread(
+                evaluate_answer,
                 question=current_question,
                 transcript="(no response)",
                 interview_profile=current_session.get("interview_profile", {}),
@@ -424,7 +440,8 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                     if current_idx < len(current_session.get("question_plan", [])):
                         current_question = current_session["question_plan"][current_idx].get("question", "")
 
-                    answer_evaluation = evaluate_answer(
+                    answer_evaluation = await asyncio.to_thread(
+                        evaluate_answer,
                         question=current_question,
                         transcript=transcript,
                         interview_profile=current_session.get("interview_profile", {}),
@@ -476,32 +493,7 @@ async def interview_websocket(ws: WebSocket, session_id: str):
                     await handle_ai_turn(ws, session_id)
 
                     if is_last:
-                        await send_json(ws, {"type": "processing_start"})
-                        final_session = await session_manager.get_session(session_id)
-
-                        scorecard_data = await generate_scorecard(
-                            conversation_history=final_session["conversation_history"],
-                            interview_profile=final_session["interview_profile"],
-                            filler_counts=final_session.get("filler_word_counts", []),
-                            answer_evaluations=final_session.get("answer_evaluations", []),
-                        )
-                        scorecard_data["session_id"] = session_id
-                        scorecard_data["answer_evaluations"] = final_session.get("answer_evaluations", [])
-                        scorecard_data["question_plan"] = final_session.get("question_plan", [])
-
-                        try:
-                            await supabase_service.save_scorecard(scorecard_data)
-                            await supabase_service.update_session_status(
-                                session_id, "completed", datetime.now(timezone.utc)
-                            )
-                        except Exception:
-                            pass
-
-                        await send_json(ws, {
-                            "type": "interview_complete",
-                            "session_id": session_id,
-                            "scorecard": scorecard_data,
-                        })
+                        await finalize_interview(ws, session_id)
                         break
 
                 except Exception as e:
@@ -525,31 +517,15 @@ async def interview_websocket(ws: WebSocket, session_id: str):
 
             elif msg_type == "end_interview":
                 try:
-                    # Try to generate a partial scorecard if there's conversation history
                     final_session = await session_manager.get_session(session_id)
                     if final_session and len(final_session.get("conversation_history", [])) > 1:
-                        try:
-                            scorecard_data = await generate_scorecard(
-                                conversation_history=final_session["conversation_history"],
-                                interview_profile=final_session["interview_profile"],
-                                filler_counts=final_session.get("filler_word_counts", []),
-                                answer_evaluations=final_session.get("answer_evaluations", []),
-                            )
-                            scorecard_data["session_id"] = session_id
-                            scorecard_data["answer_evaluations"] = final_session.get("answer_evaluations", [])
-                            scorecard_data["question_plan"] = final_session.get("question_plan", [])
-                            await supabase_service.save_scorecard(scorecard_data)
-                            await supabase_service.update_session_status(
-                                session_id, "completed", datetime.now(timezone.utc)
-                            )
-                        except Exception as e:
-                            print(f"[WS] Failed to generate partial scorecard: {e}")
-                            await supabase_service.update_session_status(session_id, "abandoned")
+                        await finalize_interview(ws, session_id)
                     else:
                         await supabase_service.update_session_status(session_id, "abandoned")
+                        await send_json(ws, {"type": "interview_complete", "session_id": session_id})
+                        await session_manager.delete_session(session_id)
                 except Exception:
                     pass
-                await send_json(ws, {"type": "interview_complete", "session_id": session_id})
                 break
 
     except WebSocketDisconnect:

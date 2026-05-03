@@ -113,12 +113,7 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     })
   }, [])
 
-  // ── markNewAiTurn ──────────────────────────────────────────────────────────
-  // Called by useInterview when a new AI turn begins (first audio_response_chunk).
-  // Resets the flag so the poll in useInterview knows audio has started arriving.
-  const markNewAiTurn = useCallback(() => {
-    hasReceivedAudioRef.current = false
-  }, [])
+
 
   // ── startRecording ─────────────────────────────────────────────────────────
   // Acquires mic fresh each turn so BT can be in A2DP during AI speech.
@@ -241,7 +236,7 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
 
   // True only once the first chunk has been scheduled AND the scheduler is empty
   const isPlaybackTrulyDone = useCallback(() => {
-    return hasReceivedAudioRef.current && getRemainingPlaybackMs() === 0
+    return hasReceivedAudioRef.current && getRemainingPlaybackMs() <= 0
   }, [getRemainingPlaybackMs])
 
   const toggleMute = useCallback(() => setIsMutedWrapped(p => !p), [setIsMutedWrapped])
@@ -255,7 +250,6 @@ export default function useAudio(sendBinaryRef, sendMessageRef) {
     resetPlaybackCursor,
     getRemainingPlaybackMs,
     isPlaybackTrulyDone,   // ← new, used by useInterview poll
-    markNewAiTurn,         // ← new, called on first audio_response_chunk
     isMuted,
     toggleMute,
     isRecording,

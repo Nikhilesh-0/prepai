@@ -1,5 +1,6 @@
 from typing import AsyncGenerator
 from app.core.config import settings
+from cartesia import AsyncCartesia
 
 VOICE_ID = "79a125e8-cd45-4c13-8a67-188112f4dd22"  # Christopher — calm, authoritative
 MODEL_ID = "sonic-english"
@@ -17,6 +18,17 @@ VOICE_SPEC = {
     "mode": "id",
 }
 
+# Module-level client — reused across all TTS calls to avoid leaking
+# HTTP sessions.  The client is lightweight and safe to share.
+_client: AsyncCartesia | None = None
+
+
+def _get_client() -> AsyncCartesia:
+    global _client
+    if _client is None:
+        _client = AsyncCartesia(api_key=settings.cartesia_api_key)
+    return _client
+
 
 async def stream_tts(text: str) -> AsyncGenerator[bytes, None]:
     """
@@ -26,9 +38,7 @@ async def stream_tts(text: str) -> AsyncGenerator[bytes, None]:
       client.tts.bytes(model_id, output_format, transcript, voice)
       returns AsyncIterator[bytes] — iterate directly, no context manager needed.
     """
-    from cartesia import AsyncCartesia
-
-    client = AsyncCartesia(api_key=settings.cartesia_api_key)
+    client = _get_client()
 
     audio_iter = await client.tts.bytes(
         model_id=MODEL_ID,
